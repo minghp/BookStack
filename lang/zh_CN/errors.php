@@ -132,4 +132,8 @@ return [
 
     // HTTP errors
     'http_ssr_url_no_match' => 'URL 与已配置的 SSR 主机不匹配',
+
+    'export_word_failed' => 'Word文档导出失败，请检查系统配置或稍后重试。',
+    'export_invalid_template' => 'Word模板文件无效或不存在。',
+    'export_timeout' => '导出操作超时，请尝试导出较小的内容。',
 ];

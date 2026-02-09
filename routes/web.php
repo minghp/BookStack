@@ -95,6 +95,7 @@ Route::middleware('auth')->group(function () {
     Route::get('/books/{bookSlug}/page/{pageSlug}/export/markdown', [ExportControllers\PageExportController::class, 'markdown']);
     Route::get('/books/{bookSlug}/page/{pageSlug}/export/plaintext', [ExportControllers\PageExportController::class, 'plainText']);
     Route::get('/books/{bookSlug}/page/{pageSlug}/export/zip', [ExportControllers\PageExportController::class, 'zip']);
+    Route::get('/books/{bookSlug}/page/{pageSlug}/export/word', [EntityControllers\PageController::class, 'exportAsWord']);
     Route::get('/books/{bookSlug}/page/{pageSlug}/edit', [EntityControllers\PageController::class, 'edit']);
     Route::get('/books/{bookSlug}/page/{pageSlug}/move', [EntityControllers\PageController::class, 'showMove']);
     Route::put('/books/{bookSlug}/page/{pageSlug}/move', [EntityControllers\PageController::class, 'move']);

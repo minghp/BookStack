@@ -18,6 +18,7 @@
         <li><a href="{{ $entity->getUrl('/export/plaintext') }}" target="_blank" role="menuitem" class="label-item"><span>{{ trans('entities.export_text') }}</span><span>.txt</span></a></li>
         <li><a href="{{ $entity->getUrl('/export/markdown') }}" target="_blank" role="menuitem" class="label-item"><span>{{ trans('entities.export_md') }}</span><span>.md</span></a></li>
         <li><a href="{{ $entity->getUrl('/export/zip') }}" target="_blank" role="menuitem" class="label-item"><span>{{ trans('entities.export_zip') }}</span><span>.zip</span></a></li>
+        <li><a href="{{ $entity->getUrl('/export/word') }}" target="_blank" role="menuitem" class="label-item"><span>{{ trans('entities.export_word') }}</span><span>.docx</span></a></li>
     </ul>
 
 </div>

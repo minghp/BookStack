@@ -24,7 +24,10 @@ use BookStack\References\ReferenceFetcher;
 use Exception;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Validation\ValidationException;
+use Symfony\Component\Process\Process;
+use Symfony\Component\Process\Exception\ProcessFailedException;
 use Throwable;
 
 class PageController extends Controller
@@ -170,6 +173,322 @@ class PageController extends Controller
             'previous'        => $nextPreviousLocator->getPrevious(),
             'referenceCount'  => $this->referenceFetcher->getReferenceCountToEntity($page),
         ]);
+    }
+
+    /**
+     * Export page as Word document.
+     *
+     * @throws NotFoundException
+     */
+    public function exportAsWord(string $bookSlug, string $pageSlug)
+    {
+        $page = $this->queries->findVisibleBySlugsOrFail($bookSlug, $pageSlug);
+        $this->checkOwnablePermission(Permission::PageView, $page);
+
+        try {
+            // Get page HTML content
+            $pageContent = (new PageContent($page));
+            $page->html = $pageContent->render();
+            
+            // Create temporary files
+            $tempDir = sys_get_temp_dir();
+            $tempHtml = $this->createTempHtmlFile($page, $tempDir);
+            $tempDocx = tempnam($tempDir, 'bookstack_word_') . '.docx';
+            
+            // Convert HTML to DOCX using pandoc
+            $this->convertHtmlToDocx($tempHtml, $tempDocx);
+            
+            // Return file download
+            return $this->sendDocxDownload($tempDocx, $page);
+            
+        } catch (NotFoundException $e) {
+            throw $e;
+        } catch (\Exception $e) {
+            Log::error('Word export failed - Page ID: ' . ($page->id ?? 'unknown'), [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            
+            return redirect($page->getUrl())
+                ->with('error', trans('errors.export_word_failed') . ': ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Create temporary HTML file for export.
+     */
+    private function createTempHtmlFile($page, string $tempDir): string
+    {
+        // Build full HTML document
+        $htmlContent = $this->buildExportHtml($page);
+        
+        // Create temporary file
+        $tempFile = tempnam($tempDir, 'bookstack_html_') . '.html';
+        file_put_contents($tempFile, $htmlContent);
+        
+        return $tempFile;
+    }
+
+    /**
+     * Build HTML content for export.
+     */
+    private function buildExportHtml($page): string
+    {
+        $pageContent = (new PageContent($page));
+        $page->html = $pageContent->render();
+        
+        // Process images in HTML
+        $baseUrl = url('/');
+        $htmlContent = preg_replace('/src="\/(uploads\/[^"]+)"/', 'src="' . $baseUrl . '/$1"', $page->html);
+        $htmlContent = preg_replace('/src="\/(storage\/[^"]+)"/', 'src="' . $baseUrl . '/$1"', $htmlContent);
+        
+        // 移除第一个h1标签（包括其内容）
+        $htmlContent = $this->removeFirstH1($htmlContent);
+        
+        // Build simple HTML document with only the content
+        return <<<HTML
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+</head>
+<body>
+    {$htmlContent}
+</body>
+</html>
+HTML;
+    }
+
+    /**
+     * 移除HTML内容中的第一个h1标签
+     */
+    private function removeFirstH1(string $html): string
+    {
+        try {
+            $dom = new \DOMDocument();
+            @$dom->loadHTML('<?xml encoding="utf-8"?>' . $html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+            $h1s = $dom->getElementsByTagName('h1');
+            if ($h1s->length > 0) {
+                $firstH1 = $h1s->item(0);
+                $firstH1->parentNode->removeChild($firstH1);
+                $html = $dom->saveHTML();
+            }
+        } catch (\Exception $e) {
+            // 如果处理失败，返回原内容
+            Log::warning('Failed to remove first h1 tag: ' . $e->getMessage());
+        }
+        
+        return $html;
+    }
+
+    /**
+     * Convert HTML to DOCX using pandoc.
+     */
+    private function convertHtmlToDocx(string $inputHtml, string $outputDocx): void
+    {
+        // Get template path
+        $templatePath = config('app.word_export_template', '/app/medical_device_template.docx');
+        
+        if (!file_exists($templatePath)) {
+            throw new \Exception("Word template file does not exist: " . $templatePath);
+        }
+        
+        // Build pandoc command
+        $command = [
+            'pandoc',
+            $inputHtml,
+            '-o', $outputDocx,
+            '--reference-doc=' . $templatePath,
+            '--resource-path=' . dirname($inputHtml),
+            '--self-contained',
+            '--wrap=none',
+            '--standalone',
+        ];
+        
+        // Execute conversion
+        $process = new Process($command);
+        $process->setTimeout(300); // 5 minutes timeout
+        $process->run();
+        
+        // Clean up temporary HTML file
+        if (file_exists($inputHtml)) {
+            @unlink($inputHtml);
+        }
+        
+        if (!$process->isSuccessful()) {
+            throw new ProcessFailedException($process);
+        }
+        
+        // Check output file
+        if (!file_exists($outputDocx) || filesize($outputDocx) === 0) {
+            throw new \Exception('Generated Word document is empty or does not exist');
+        }
+    }
+
+    /**
+     * Send DOCX file download.
+     */
+    private function sendDocxDownload(string $filePath, $page)
+    {
+        $filename = $this->generateFilename($page);
+        
+        return response()->download($filePath, $filename, [
+            'Content-Type' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'Content-Length' => filesize($filePath),
+            'Cache-Control' => 'no-cache, no-store, must-revalidate',
+            'Pragma' => 'no-cache',
+            'Expires' => '0',
+        ])->deleteFileAfterSend(true);
+    }
+
+    /**
+     * Generate download filename.
+     */
+    private function generateFilename($page): string
+    {
+        // 获取页面标题
+        $title = $page->name;
+        
+        // Windows/Linux文件名中不允许的字符：\/:*?"<>|
+        // 将这些字符替换为下划线
+        $illegalChars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+        $safeName = str_replace($illegalChars, '_', $title);
+        
+        // 如果过滤后为空，使用默认文件名
+        if (empty(trim($safeName))) {
+            $safeName = 'document_' . $page->id;
+        }
+        
+        // 去除首尾空格和下划线
+        $safeName = trim($safeName, " _");
+        
+        // 限制长度
+        if (mb_strlen($safeName, 'UTF-8') > 100) {
+            $safeName = mb_substr($safeName, 0, 100, 'UTF-8');
+        }
+        
+        return "{$safeName}.docx";
+    }
+
+    /**
+     * Get export styles.
+     */
+    private function getExportStyles(): string
+    {
+        return <<<CSS
+body {
+    font-family: 'Microsoft YaHei', 'SimSun', serif;
+    font-size: 12pt;
+    line-height: 1.5;
+    color: #000000;
+    margin: 2cm;
+}
+
+h1 {
+    font-size: 20pt;
+    color: #000080;
+    text-align: center;
+    margin-bottom: 30px;
+    border-bottom: 2px solid #000080;
+    padding-bottom: 10px;
+}
+
+h2 {
+    font-size: 16pt;
+    color: #000080;
+    margin-top: 24px;
+    margin-bottom: 12px;
+}
+
+h3 {
+    font-size: 14pt;
+    color: #000080;
+    margin-top: 18px;
+    margin-bottom: 9px;
+}
+
+.export-header {
+    text-align: center;
+    margin-bottom: 40px;
+}
+
+.page-metadata {
+    font-size: 10pt;
+    color: #666666;
+    margin: 20px 0;
+    text-align: left;
+    border-top: 1px solid #cccccc;
+    padding-top: 10px;
+}
+
+.export-content {
+    text-align: justify;
+}
+
+.export-content img {
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 15px auto;
+}
+
+.export-content table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 15px 0;
+}
+
+.export-content table, 
+.export-content th, 
+.export-content td {
+    border: 1px solid #000000;
+}
+
+.export-content th, 
+.export-content td {
+    padding: 8px 12px;
+    text-align: left;
+}
+
+.export-content th {
+    background-color: #f2f2f2;
+    font-weight: bold;
+}
+
+.export-content pre, 
+.export-content code {
+    background-color: #f8f8f8;
+    font-family: 'Courier New', monospace;
+}
+
+.export-content pre {
+    padding: 12px;
+    overflow-x: auto;
+    border-left: 3px solid #000080;
+    margin: 15px 0;
+}
+
+.export-content blockquote {
+    border-left: 4px solid #000080;
+    padding-left: 20px;
+    margin-left: 0;
+    color: #444444;
+    font-style: italic;
+}
+
+.export-content ul, 
+.export-content ol {
+    margin: 10px 0 10px 30px;
+}
+
+.export-content li {
+    margin-bottom: 5px;
+}
+
+.page-break {
+    page-break-before: always;
+}
+CSS;
     }
 
     /**

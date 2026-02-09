@@ -40,6 +40,7 @@ return [
     'export_text' => '纯文本文件',
     'export_md' => 'Markdown 文件',
     'export_zip' => '便携版本 ZIP',
+    'export_word' => '导出为Word',
     'default_template' => '默认页面模板',
     'default_template_explain' => '指定一个页面模板，该模板将作为此项目中所有页面的默认内容。请注意，仅当页面创建者具有对所选页面模板的查看访问权限时，此功能才会生效。',
     'default_template_select' => '选择模板页面',
