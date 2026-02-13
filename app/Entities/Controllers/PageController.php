@@ -30,6 +30,8 @@ use Symfony\Component\Process\Process;
 use Symfony\Component\Process\Exception\ProcessFailedException;
 use Throwable;
 
+use ZipArchive;  // 请在文件顶部添加此 use
+
 class PageController extends Controller
 {
     public function __construct(
@@ -237,26 +239,46 @@ class PageController extends Controller
         $pageContent = (new PageContent($page));
         $page->html = $pageContent->render();
         
-        // Process images in HTML
         $baseUrl = url('/');
         $htmlContent = preg_replace('/src="\/(uploads\/[^"]+)"/', 'src="' . $baseUrl . '/$1"', $page->html);
         $htmlContent = preg_replace('/src="\/(storage\/[^"]+)"/', 'src="' . $baseUrl . '/$1"', $htmlContent);
         
-        // 移除第一个h1标签（包括其内容）
+        // 移除第一个 h1 标签（文档名称）
         $htmlContent = $this->removeFirstH1($htmlContent);
+
+        // 2. 为正文第一个块级元素应用样式（居中、宋体、12pt、加粗）
+        $htmlContent = $this->styleFirstElement($htmlContent);
+
+        // 3. 缩进占位符（模拟首行缩进）
+        $htmlContent = $this->insertIndentPlaceholders($htmlContent);
         
-        // Build simple HTML document with only the content
-        return <<<HTML
+        // 4. 替换不间断空格（消除小圆圈）
+        $htmlContent = $this->replaceNonBreakingSpaces($htmlContent);
+
+        // 5. 构建最终 HTML
+        $exportStyles = $this->getExportStyles();
+        
+
+        $htmlString = <<<HTML
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
+    <style>{$exportStyles}</style>
 </head>
 <body>
     {$htmlContent}
 </body>
 </html>
 HTML;
+
+    // ----- 🔧 调试：保存中间 HTML 文件 -----
+    // $debugPath = storage_path('logs/export_debug_' . time() . '_' . uniqid() . '.html');
+    // file_put_contents($debugPath, $htmlString);
+    // \Illuminate\Support\Facades\Log::info('Word export - intermediate HTML saved', ['path' => $debugPath]);
+    // ---------------------------------------
+
+    return $htmlString;
     }
 
     /**
@@ -282,44 +304,124 @@ HTML;
     }
 
     /**
-     * Convert HTML to DOCX using pandoc.
+     * 将 HTML 中的所有不间断空格（&nbsp;, &#160;, \xC2\xA0）替换为普通空格。
+     * 防止 WPS/Word 在显示段落标记时渲染为小圆圈（°）。
+     *
+     * @param string $html HTML 片段
+     * @return string 处理后的 HTML
+     */
+    private function replaceNonBreakingSpaces(string $html): string
+    {
+        // 替换 HTML 实体
+        $html = str_replace(['&nbsp;', '&#160;', '&#xA0;'], ' ', $html);
+        
+        // 替换原始 Unicode 不间断空格字符 (U+00A0)
+        $html = str_replace("\xC2\xA0", ' ', $html);
+        
+        // 可选：替换其他常见空白变体（如窄空格等），但通常不需要
+        // $html = str_replace("\xE2\x80\xAF", ' ', $html); // 窄空格
+        
+        return $html;
+    }
+    
+    /**
+     * 打开 docx 文件，删除所有 <w:br/> 节点，保存修改。
+     */
+    private function removeSoftBreaksFromDocx(string $docxPath): void
+    {
+        if (!class_exists('ZipArchive')) {
+            Log::warning('ZipArchive not available, cannot remove soft breaks from docx');
+            return;
+        }
+
+        $zip = new ZipArchive();
+        if ($zip->open($docxPath, ZipArchive::CREATE) !== true) {
+            Log::error('Failed to open docx file for soft break removal', ['path' => $docxPath]);
+            return;
+        }
+
+        $documentXml = $zip->getFromName('word/document.xml');
+        if ($documentXml === false) {
+            $zip->close();
+            Log::error('word/document.xml not found in docx');
+            return;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadXML($documentXml);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+
+        $breaks = $xpath->query('//w:br');
+        $removedCount = 0;
+        foreach ($breaks as $br) {
+            $br->parentNode->removeChild($br);
+            $removedCount++;
+        }
+
+        if ($removedCount > 0) {
+            $newXml = $dom->saveXML();
+            $zip->addFromString('word/document.xml', $newXml);
+        }
+
+        $zip->close();
+
+        // Log::info('Removed soft breaks from docx', [
+        //     'count' => $removedCount,
+        //     'path' => $docxPath
+        // ]);
+    }
+
+    /**
+     * Convert HTML to DOCX using pandoc, then apply post-processing:
+     * - Remove all soft breaks (<w:br/>)
+     * - Force first paragraph style (centered, SimSun, 12pt, bold)
      */
     private function convertHtmlToDocx(string $inputHtml, string $outputDocx): void
     {
-        // Get template path
-        $templatePath = config('app.word_export_template', '/app/medical_device_template.docx');
-        
-        if (!file_exists($templatePath)) {
-            throw new \Exception("Word template file does not exist: " . $templatePath);
-        }
-        
-        // Build pandoc command
+        // ----- 1. 准备 pandoc 命令 -----
         $command = [
             'pandoc',
             $inputHtml,
             '-o', $outputDocx,
-            '--reference-doc=' . $templatePath,
             '--resource-path=' . dirname($inputHtml),
             '--self-contained',
             '--wrap=none',
             '--standalone',
         ];
-        
-        // Execute conversion
+
+        // 添加自定义模板（如果存在）
+        $templatePath = config('app.word_export_template', '/app/medical_device_template.docx');
+        if (file_exists($templatePath)) {
+            $command[] = '--reference-doc=' . $templatePath;
+        } else {
+            Log::warning('Word export template not found, using pandoc default', ['path' => $templatePath]);
+        }
+
+        // ----- 2. 执行 pandoc 转换 -----
         $process = new Process($command);
-        $process->setTimeout(300); // 5 minutes timeout
+        $process->setTimeout(300);
         $process->run();
-        
-        // Clean up temporary HTML file
+
+        // 清理临时 HTML 文件
         if (file_exists($inputHtml)) {
             @unlink($inputHtml);
         }
-        
+
         if (!$process->isSuccessful()) {
             throw new ProcessFailedException($process);
         }
-        
-        // Check output file
+
+        // ----- 3. 后处理：删除所有软回车 -----
+        $this->removeSoftBreaksFromDocx($outputDocx);
+
+        // ----- 4. 后处理：强制设置第一个段落样式（居中、宋体、12pt、加粗）-----
+        $this->applyFirstParagraphStyleToDocx($outputDocx);
+
+        // ----- 5. 验证输出文件 -----
         if (!file_exists($outputDocx) || filesize($outputDocx) === 0) {
             throw new \Exception('Generated Word document is empty or does not exist');
         }
@@ -369,128 +471,465 @@ HTML;
         
         return "{$safeName}.docx";
     }
+    
+    /**
+     * 为 HTML 片段中的第一个非空块级元素应用样式（居中、宋体、12pt、加粗）。
+     * 此方法专用于在 removeFirstH1() 之后调用，将紧随其后的首个内容块样式化。
+     *
+     * @param string $html HTML 片段
+     * @return string 处理后的 HTML 片段
+     */
+    private function styleFirstElement(string $html): string
+    {
+        if (!extension_loaded('dom')) {
+            return $html;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadHTML('<?xml encoding="utf-8"?>' . $html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        libxml_clear_errors();
+
+        $firstElement = null;
+        $skippedCount = 0;
+        
+        // 定义需要处理的块级元素标签（可根据需要增删）
+        $blockTags = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'pre', 'blockquote', 'table', 'ul', 'ol'];
+        
+        foreach ($dom->childNodes as $child) {
+            if (!$child instanceof \DOMElement) {
+                continue;
+            }
+
+            if (in_array($child->tagName, $blockTags)) {
+                // 检查元素是否为空（无文本且非表格）
+                $textContent = trim($child->textContent);
+                if ($textContent === '' && $child->tagName !== 'table') {
+                    $skippedCount++;
+                    continue;
+                }
+                $firstElement = $child;
+                break;
+            }
+            $skippedCount++;
+        }
+
+        if ($firstElement) {
+            // 目标样式：居中、宋体/SimSun、12pt、加粗
+            $targetStyle = 'text-align: center; font-family: SimSun, 宋体; font-size: 12pt; font-weight: bold;';
+            
+            $existingStyle = $firstElement->getAttribute('style');
+            if ($existingStyle) {
+                // 移除可能与目标冲突的属性
+                $existingStyle = preg_replace('/text-align\s*:[^;]+;?/', '', $existingStyle);
+                $existingStyle = preg_replace('/font-family\s*:[^;]+;?/', '', $existingStyle);
+                $existingStyle = preg_replace('/font-size\s*:[^;]+;?/', '', $existingStyle);
+                $existingStyle = preg_replace('/font-weight\s*:[^;]+;?/', '', $existingStyle);
+                $newStyle = trim($existingStyle . ' ' . $targetStyle);
+            } else {
+                $newStyle = $targetStyle;
+            }
+            
+            $firstElement->setAttribute('style', $newStyle);
+            
+            // 添加类名 first-element（便于调试）
+            $class = $firstElement->getAttribute('class');
+            $class = trim(preg_replace('/\bfirst-element\b/', '', $class));
+            $class .= ' first-element';
+            $firstElement->setAttribute('class', trim($class));
+            
+            // ----- 关键日志：输出命中的元素信息 -----
+            // \Illuminate\Support\Facades\Log::info('styleFirstElement() - 已应用样式到首元素', [
+            //     'tag' => $firstElement->tagName,
+            //     'id' => $firstElement->getAttribute('id'),
+            //     'class' => $firstElement->getAttribute('class'),
+            //     'content' => mb_substr(trim($firstElement->textContent), 0, 50),
+            //     'skipped_count' => $skippedCount
+            // ]);
+        } else {
+            \Illuminate\Support\Facades\Log::warning('styleFirstElement() - 未找到合适的块级元素', [
+                'html_sample' => mb_substr($html, 0, 200)
+            ]);
+        }
+
+        // 重新拼接 HTML 片段（保持无 <body> 包装）
+        $innerHtml = '';
+        foreach ($dom->childNodes as $child) {
+            if ($child instanceof \DOMProcessingInstruction) {
+                continue;
+            }
+            $innerHtml .= $dom->saveHTML($child);
+        }
+        
+        return $innerHtml;
+    }
+        
 
     /**
-     * Get export styles.
+     * 强制设置 docx 中第一个段落为：居中、宋体、18pt（小二）、加粗。
+     * 同时覆盖段落属性和所有运行属性，确保不被 Pandoc 内联样式覆盖。
+     */
+    private function applyFirstParagraphStyleToDocx(string $docxPath): void
+    {
+        if (!class_exists('ZipArchive')) {
+            Log::warning('ZipArchive not available, cannot apply first paragraph style');
+            return;
+        }
+
+        $zip = new ZipArchive();
+        if ($zip->open($docxPath, ZipArchive::CREATE) !== true) {
+            Log::error('Failed to open docx file for applying first paragraph style', ['path' => $docxPath]);
+            return;
+        }
+
+        $documentXml = $zip->getFromName('word/document.xml');
+        if ($documentXml === false) {
+            $zip->close();
+            Log::error('word/document.xml not found in docx');
+            return;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadXML($documentXml);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+
+        // ----- 1. 找到第一个段落 <w:p> -----
+        $paragraphs = $xpath->query('//w:p');
+        if ($paragraphs->length === 0) {
+            $zip->close();
+            Log::warning('No paragraph found in docx, cannot apply first paragraph style');
+            return;
+        }
+        $firstP = $paragraphs->item(0);
+
+        // ----- 2. 确保 <w:pPr> 存在并设置居中对齐 -----
+        $pPr = $xpath->query('w:pPr', $firstP)->item(0);
+        if (!$pPr) {
+            $pPr = $dom->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:pPr');
+            $firstP->insertBefore($pPr, $firstP->firstChild);
+        }
+
+        // 设置居中对齐
+        $jc = $xpath->query('w:jc', $pPr)->item(0);
+        if (!$jc) {
+            $jc = $dom->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:jc');
+            $pPr->appendChild($jc);
+        }
+        $jc->setAttribute('w:val', 'center');
+
+        // ----- 3. 段落默认字符属性（用于没有直接格式的文本）-----
+        $pRPr = $xpath->query('w:rPr', $pPr)->item(0);
+        if (!$pRPr) {
+            $pRPr = $dom->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:rPr');
+            $pPr->appendChild($pRPr);
+        }
+        // 设置段落默认字体、字号、加粗（18pt = w:sz 36）
+        $this->setRunProperties($pRPr, '36', 'SimSun', '宋体', true);
+
+        // ----- 4. 遍历所有 <w:r> 运行，强制设置相同的属性（覆盖 Pandoc 内联样式）-----
+        $runs = $xpath->query('.//w:r', $firstP);
+        foreach ($runs as $run) {
+            $rPr = $xpath->query('w:rPr', $run)->item(0);
+            if (!$rPr) {
+                $rPr = $dom->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:rPr');
+                $run->insertBefore($rPr, $run->firstChild);
+            }
+            $this->setRunProperties($rPr, '36', 'SimSun', '宋体', true);
+        }
+
+        // ----- 5. 保存修改后的 XML -----
+        $newXml = $dom->saveXML();
+        $zip->addFromString('word/document.xml', $newXml);
+        $zip->close();
+
+        // Log::info('Applied first paragraph style to docx (18pt, SimSun, bold, centered)', ['path' => $docxPath]);
+    }
+
+    /**
+     * 辅助方法：设置 <w:rPr> 的字体、字号、加粗
+     */
+    private function setRunProperties(\DOMElement $rPr, string $szVal, string $asciiFont, string $eastAsiaFont, bool $bold): void
+    {
+        $dom = $rPr->ownerDocument;
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+
+        // 设置字体
+        $rFonts = $xpath->query('w:rFonts', $rPr)->item(0);
+        if (!$rFonts) {
+            $rFonts = $dom->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:rFonts');
+            $rPr->appendChild($rFonts);
+        }
+        $rFonts->setAttribute('w:ascii', $asciiFont);
+        $rFonts->setAttribute('w:hAnsi', $asciiFont);
+        $rFonts->setAttribute('w:eastAsia', $eastAsiaFont);
+        $rFonts->setAttribute('w:cs', $asciiFont);
+
+        // 设置字号（18pt = 36）
+        $sz = $xpath->query('w:sz', $rPr)->item(0);
+        if (!$sz) {
+            $sz = $dom->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:sz');
+            $rPr->appendChild($sz);
+        }
+        $sz->setAttribute('w:val', $szVal);
+
+        $szCs = $xpath->query('w:szCs', $rPr)->item(0);
+        if (!$szCs) {
+            $szCs = $dom->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:szCs');
+            $rPr->appendChild($szCs);
+        }
+        $szCs->setAttribute('w:val', $szVal);
+
+        // 设置加粗
+        $b = $xpath->query('w:b', $rPr)->item(0);
+        if (!$b) {
+            $b = $dom->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:b');
+            $rPr->appendChild($b);
+        }
+        $b->setAttribute('w:val', $bold ? 'true' : 'false');
+
+        $bCs = $xpath->query('w:bCs', $rPr)->item(0);
+        if (!$bCs) {
+            $bCs = $dom->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:bCs');
+            $rPr->appendChild($bCs);
+        }
+        $bCs->setAttribute('w:val', $bold ? 'true' : 'false');
+    }
+
+
+    /**
+     * 为所有带 text-indent 的块级元素插入全角空格占位符，模拟首行缩进。
+     * 同时移除原有的 text-indent 样式，避免 Pandoc 干扰。
+     *
+     * @param string $html HTML 片段
+     * @return string 处理后的 HTML
+     */
+    private function insertIndentPlaceholders(string $html): string
+    {
+        if (!extension_loaded('dom')) {
+            return $html;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadHTML('<?xml encoding="utf-8"?>' . $html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        // 只处理块级元素（可根据需要增删）
+        $blockTags = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li'];
+        $nodes = $xpath->query('//*[@style]');
+
+        $modifiedCount = 0;
+        foreach ($nodes as $node) {
+            // 只处理块级标签
+            if (!in_array($node->tagName, $blockTags)) {
+                continue;
+            }
+
+            $style = $node->getAttribute('style');
+            if (!preg_match('/text-indent:\s*([^;]+);/', $style, $matches)) {
+                continue;
+            }
+
+            $indentValue = trim($matches[1]);
+            // 提取数值，忽略单位
+            preg_match('/([\d.]+)/', $indentValue, $numMatches);
+            $indentNum = floatval($numMatches[0] ?? 0);
+
+            // 缩进阈值：> 5pt 或 > 0.5em 认为需要缩进
+            $shouldIndent = false;
+            if (strpos($indentValue, 'pt') !== false && $indentNum > 5) {
+                $shouldIndent = true;
+            }
+            if (strpos($indentValue, 'em') !== false && $indentNum > 0.5) {
+                $shouldIndent = true;
+            }
+            // 其他单位可酌情添加
+
+            if (!$shouldIndent) {
+                continue;
+            }
+
+            // ----- 在元素内容最前面插入两个全角空格 -----
+            $fullwidthSpace = '　'; // UTF-8 全角空格，直接按字面量
+            $spaceNode = $dom->createTextNode($fullwidthSpace . $fullwidthSpace);
+            
+            // 如果元素有子节点，插入到第一个子节点之前
+            if ($node->hasChildNodes()) {
+                $node->insertBefore($spaceNode, $node->firstChild);
+            } else {
+                // 空元素，直接追加文本节点
+                $node->appendChild($spaceNode);
+            }
+
+            // ----- 移除原有的 text-indent 样式，避免干扰 -----
+            $style = preg_replace('/text-indent:\s*[^;]+;?/', '', $style);
+            if (trim($style) === '') {
+                $node->removeAttribute('style');
+            } else {
+                $node->setAttribute('style', $style);
+            }
+
+            $modifiedCount++;
+        }
+
+        // ----- 重新拼接 HTML 片段 -----
+        $innerHtml = '';
+        foreach ($dom->childNodes as $child) {
+            if ($child instanceof \DOMProcessingInstruction) {
+                continue;
+            }
+            $innerHtml .= $dom->saveHTML($child);
+        }
+
+        // 调试日志（可保留或删除）
+        // \Illuminate\Support\Facades\Log::info('insertIndentPlaceholders() - processed', [
+        //     'modified_count' => $modifiedCount,
+        //     'html_length' => strlen($innerHtml)
+        // ]);
+
+        return $innerHtml;
+    }
+
+    /**
+     * 样式
      */
     private function getExportStyles(): string
     {
-        return <<<CSS
-body {
-    font-family: 'Microsoft YaHei', 'SimSun', serif;
-    font-size: 12pt;
-    line-height: 1.5;
-    color: #000000;
-    margin: 2cm;
-}
-
-h1 {
-    font-size: 20pt;
-    color: #000080;
-    text-align: center;
-    margin-bottom: 30px;
-    border-bottom: 2px solid #000080;
-    padding-bottom: 10px;
-}
-
-h2 {
-    font-size: 16pt;
-    color: #000080;
-    margin-top: 24px;
-    margin-bottom: 12px;
-}
-
-h3 {
-    font-size: 14pt;
-    color: #000080;
-    margin-top: 18px;
-    margin-bottom: 9px;
-}
-
-.export-header {
-    text-align: center;
-    margin-bottom: 40px;
-}
-
-.page-metadata {
-    font-size: 10pt;
-    color: #666666;
-    margin: 20px 0;
-    text-align: left;
-    border-top: 1px solid #cccccc;
-    padding-top: 10px;
-}
-
-.export-content {
-    text-align: justify;
-}
-
-.export-content img {
-    max-width: 100%;
-    height: auto;
-    display: block;
-    margin: 15px auto;
-}
-
-.export-content table {
-    width: 100%;
-    border-collapse: collapse;
-    margin: 15px 0;
-}
-
-.export-content table, 
-.export-content th, 
-.export-content td {
-    border: 1px solid #000000;
-}
-
-.export-content th, 
-.export-content td {
-    padding: 8px 12px;
-    text-align: left;
-}
-
-.export-content th {
-    background-color: #f2f2f2;
-    font-weight: bold;
-}
-
-.export-content pre, 
-.export-content code {
-    background-color: #f8f8f8;
-    font-family: 'Courier New', monospace;
-}
-
-.export-content pre {
-    padding: 12px;
-    overflow-x: auto;
-    border-left: 3px solid #000080;
-    margin: 15px 0;
-}
-
-.export-content blockquote {
-    border-left: 4px solid #000080;
-    padding-left: 20px;
-    margin-left: 0;
-    color: #444444;
-    font-style: italic;
-}
-
-.export-content ul, 
-.export-content ol {
-    margin: 10px 0 10px 30px;
-}
-
-.export-content li {
-    margin-bottom: 5px;
-}
-
-.page-break {
-    page-break-before: always;
-}
-CSS;
+        $baseStyles = <<<CSS
+    body {
+        font-family: 'Microsoft YaHei', 'SimSun', serif;
+        font-size: 12pt;
+        line-height: 1.5;
+        color: #000000;
+        margin: 2cm;
     }
 
+    /* 页面内容区域样式 */
+    .page-content h1 {
+        font-size: 20pt;
+        color: #000080;
+        text-align: center;
+        margin-bottom: 30px;
+        border-bottom: 2px solid #000080;
+        padding-bottom: 10px;
+    }
+    .page-content h2 {
+        font-size: 16pt;
+        color: #000080;
+        margin-top: 24px;
+        margin-bottom: 12px;
+    }
+    .page-content h3 {
+        font-size: 14pt;
+        color: #000080;
+        margin-top: 18px;
+        margin-bottom: 9px;
+    }
+    .page-content img {
+        max-width: 100%;
+        height: auto;
+        display: block;
+        margin: 15px auto;
+    }
+    .page-content table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 15px 0;
+        border: 1px solid #000000;
+    }
+    .page-content th,
+    .page-content td {
+        border: 1px solid #000000;
+        padding: 8px 12px;
+        text-align: left;
+    }
+    .page-content th {
+        background-color: #f2f2f2;
+        font-weight: bold;
+    }
+    .page-content pre,
+    .page-content code {
+        background-color: #f8f8f8;
+        font-family: 'Courier New', monospace;
+    }
+    .page-content pre {
+        padding: 12px;
+        overflow-x: auto;
+        border-left: 3px solid #000080;
+        margin: 15px 0;
+    }
+    .page-content blockquote {
+        border-left: 4px solid #000080;
+        padding-left: 20px;
+        margin-left: 0;
+        color: #444444;
+        font-style: italic;
+    }
+    .page-content ul,
+    .page-content ol {
+        margin: 10px 0 10px 30px;
+    }
+    .page-content li {
+        margin-bottom: 5px;
+    }
+
+    .page-content table,
+    .page-content td,
+    .page-content th {
+        border-style: solid !important;
+    }
+
+    /* 表格边框统一 */
+    table, td, th {
+        border-collapse: collapse;
+        border: 1px solid black;
+    }
+    td, th {
+        padding: 4px 8px;
+    }
+
+    /* 预格式文本保留空白 */
+    pre {
+        white-space: pre-wrap;
+    }
+    CSS;
+
+        // ----- 终极强制表格边框实线（类优先级 + !important）-----
+        $ultimates = <<<CSS
+
+    /* 终极强制：所有带 export-solid-border 的表格及其单元格边框为实线 */
+    .export-solid-border,
+    .export-solid-border td,
+    .export-solid-border th,
+    .export-solid-border tr,
+    .export-solid-border tbody,
+    .export-solid-border thead,
+    .export-solid-border tfoot {
+        border-style: solid !important;
+        border-collapse: collapse !important;
+    }
+
+    .export-solid-border {
+        border: 1px solid #000000 !important;
+    }
+    .export-solid-border td,
+    .export-solid-border th {
+        border: 1px solid #000000 !important;
+        padding: 4px 8px !important;
+    }
+    CSS;
+
+        // 合并两个样式块并返回
+        return $baseStyles . "\n\n" . $ultimates;
+    }
+
+    
     /**
      * Get page from an ajax request.
      *
