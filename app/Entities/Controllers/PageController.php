@@ -376,6 +376,123 @@ HTML;
     }
 
     /**
+     * 为 docx 文件中所有表格添加边框。
+     * 通过修改 word/document.xml 中的 <w:tblPr> 和 <w:tcPr> 元素实现。
+     */
+    private function addTableBordersToDocx(string $docxPath): void
+    {
+        if (!class_exists('ZipArchive')) {
+            Log::warning('ZipArchive not available, cannot add table borders');
+            return;
+        }
+
+        $zip = new ZipArchive();
+        if ($zip->open($docxPath, ZipArchive::CREATE) !== true) {
+            Log::error('Failed to open docx file for adding table borders', ['path' => $docxPath]);
+            return;
+        }
+
+        $documentXml = $zip->getFromName('word/document.xml');
+        if ($documentXml === false) {
+            $zip->close();
+            Log::error('word/document.xml not found in docx');
+            return;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadXML($documentXml);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+
+        $tables = $xpath->query('//w:tbl');
+        if ($tables->length === 0) {
+            $zip->close();
+            return;
+        }
+
+        foreach ($tables as $table) {
+            $this->applyBorderToTable($dom, $xpath, $table);
+        }
+
+        $newXml = $dom->saveXML();
+        $zip->addFromString('word/document.xml', $newXml);
+        $zip->close();
+
+        Log::info('Added table borders to docx', ['tables_count' => $tables->length, 'path' => $docxPath]);
+    }
+
+    /**
+     * 为单个表格应用边框样式。
+     * 为表格添加 <w:tblPr><w:tblBorders>，为每个单元格添加 <w:tcPr><w:tcBorders>。
+     */
+    private function applyBorderToTable(\DOMDocument $dom, \DOMXPath $xpath, \DOMElement $table): void
+    {
+        $wNs = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+
+        $tblPr = $xpath->query('w:tblPr', $table)->item(0);
+        if (!$tblPr) {
+            $tblPr = $dom->createElementNS($wNs, 'w:tblPr');
+            $table->insertBefore($tblPr, $table->firstChild);
+        }
+
+        $tblBorders = $xpath->query('w:tblBorders', $tblPr)->item(0);
+        if (!$tblBorders) {
+            $tblBorders = $dom->createElementNS($wNs, 'w:tblBorders');
+            $tblPr->appendChild($tblBorders);
+        }
+
+        $borderType = 'single';
+        $borderSize = '8';
+        $borderColor = '000000';
+
+        $borderPositions = ['top', 'left', 'bottom', 'right', 'insideH', 'insideV'];
+        foreach ($borderPositions as $pos) {
+            $border = $xpath->query('w:' . $pos, $tblBorders)->item(0);
+            if (!$border) {
+                $border = $dom->createElementNS($wNs, 'w:' . $pos);
+                $tblBorders->appendChild($border);
+            }
+            $border->setAttribute('w:val', $borderType);
+            $border->setAttribute('w:sz', $borderSize);
+            $border->setAttribute('w:space', '0');
+            $border->setAttribute('w:color', $borderColor);
+        }
+
+        $rows = $xpath->query('.//w:tr', $table);
+        foreach ($rows as $row) {
+            $cells = $xpath->query('.//w:tc', $row);
+            foreach ($cells as $cell) {
+                $tcPr = $xpath->query('w:tcPr', $cell)->item(0);
+                if (!$tcPr) {
+                    $tcPr = $dom->createElementNS($wNs, 'w:tcPr');
+                    $cell->insertBefore($tcPr, $cell->firstChild);
+                }
+
+                $tcBorders = $xpath->query('w:tcBorders', $tcPr)->item(0);
+                if (!$tcBorders) {
+                    $tcBorders = $dom->createElementNS($wNs, 'w:tcBorders');
+                    $tcPr->appendChild($tcBorders);
+                }
+
+                foreach ($borderPositions as $pos) {
+                    $border = $xpath->query('w:' . $pos, $tcBorders)->item(0);
+                    if (!$border) {
+                        $border = $dom->createElementNS($wNs, 'w:' . $pos);
+                        $tcBorders->appendChild($border);
+                    }
+                    $border->setAttribute('w:val', $borderType);
+                    $border->setAttribute('w:sz', $borderSize);
+                    $border->setAttribute('w:space', '0');
+                    $border->setAttribute('w:color', $borderColor);
+                }
+            }
+        }
+    }
+
+    /**
      * Convert HTML to DOCX using pandoc, then apply post-processing:
      * - Remove all soft breaks (<w:br/>)
      * - Force first paragraph style (centered, SimSun, 12pt, bold)
@@ -421,7 +538,10 @@ HTML;
         // ----- 4. 后处理：强制设置第一个段落样式（居中、宋体、12pt、加粗）-----
         $this->applyFirstParagraphStyleToDocx($outputDocx);
 
-        // ----- 5. 验证输出文件 -----
+        // ----- 5. 后处理：为所有表格添加边框 -----
+        $this->addTableBordersToDocx($outputDocx);
+
+        // ----- 6. 验证输出文件 -----
         if (!file_exists($outputDocx) || filesize($outputDocx) === 0) {
             throw new \Exception('Generated Word document is empty or does not exist');
         }
