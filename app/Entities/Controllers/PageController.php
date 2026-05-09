@@ -255,7 +255,10 @@ class PageController extends Controller
         // 4. 替换不间断空格（消除小圆圈）
         $htmlContent = $this->replaceNonBreakingSpaces($htmlContent);
 
-        // 5. 构建最终 HTML
+        // 5. 移除不存在的图片（防止 pandoc 报错）
+        $htmlContent = $this->removeInvalidImages($htmlContent);
+
+        // 6. 构建最终 HTML
         $exportStyles = $this->getExportStyles();
         
 
@@ -296,11 +299,88 @@ HTML;
                 $html = $dom->saveHTML();
             }
         } catch (\Exception $e) {
-            // 如果处理失败，返回原内容
             Log::warning('Failed to remove first h1 tag: ' . $e->getMessage());
         }
-        
+
         return $html;
+    }
+
+    /**
+     * 移除HTML中不存在的图片引用。
+     * pandoc --self-contained 模式下，如果图片不存在会直接报错退出。
+     * 此方法确保只有存在的图片会被包含在HTML中。
+     */
+    private function removeInvalidImages(string $html): string
+    {
+        try {
+            $dom = new \DOMDocument();
+            @$dom->loadHTML('<?xml encoding="utf-8"?>' . $html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+            $images = $dom->getElementsByTagName('img');
+
+            $toRemove = [];
+            foreach ($images as $img) {
+                $src = $img->getAttribute('src');
+                if (empty($src)) {
+                    continue;
+                }
+
+                $isLocalFile = !$this->isRemoteUrl($src);
+                if ($isLocalFile) {
+                    $localPath = $this->resolveLocalPath($src);
+                    if (!file_exists($localPath)) {
+                        $toRemove[] = $img;
+                    }
+                }
+            }
+
+            foreach ($toRemove as $img) {
+                $img->parentNode->removeChild($img);
+            }
+
+            if (count($toRemove) > 0) {
+                Log::info('Removed invalid images from export HTML', [
+                    'count' => count($toRemove)
+                ]);
+                $html = $dom->saveHTML();
+            }
+        } catch (\Exception $e) {
+            Log::warning('Failed to remove invalid images: ' . $e->getMessage());
+        }
+
+        return $html;
+    }
+
+    /**
+     * 判断URL是否为远程URL
+     */
+    private function isRemoteUrl(string $url): bool
+    {
+        return str_starts_with($url, 'http://')
+            || str_starts_with($url, 'https://')
+            || str_starts_with($url, '//');
+    }
+
+    /**
+     * 将相对路径或绝对URL转换为本地文件系统路径
+     */
+    private function resolveLocalPath(string $src): string
+    {
+        if (str_starts_with($src, 'file://')) {
+            return substr($src, 7);
+        }
+
+        if (str_starts_with($src, '/')) {
+            return public_path(ltrim($src, '/'));
+        }
+
+        if (str_starts_with($src, 'http://') || str_starts_with($src, 'https://')) {
+            $parsed = parse_url($src);
+            if (isset($parsed['path'])) {
+                return public_path(ltrim($parsed['path'], '/'));
+            }
+        }
+
+        return public_path($src);
     }
 
     /**
