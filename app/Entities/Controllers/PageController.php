@@ -735,6 +735,8 @@ class PageController extends Controller
 
         $this->removeSoftBreaksFromDocx($outputDocx);
         $this->addTableBordersToDocx($outputDocx);
+        $this->centerHeadingsInDocx($outputDocx);
+        $this->applyFirstParagraphStyleToDocx($outputDocx);
 
         if (!file_exists($outputDocx) || filesize($outputDocx) === 0) {
             throw new \Exception('Generated Word document is empty or does not exist');
@@ -771,8 +773,8 @@ class PageController extends Controller
         // 移除第一个 h1 标签（文档名称）
         $htmlContent = $this->removeFirstH1($htmlContent);
 
-        // 2. 为正文第一个块级元素应用样式（居中、宋体、12pt、加粗）
-        $htmlContent = $this->styleFirstElement($htmlContent);
+        // 为正文第一个块级元素应用样式（居中、作为标题）
+        $htmlContent = $this->styleFirstElementAsHeading($htmlContent);
 
         // 3. 缩进占位符（模拟首行缩进）
         $htmlContent = $this->insertIndentPlaceholders($htmlContent);
@@ -1348,6 +1350,147 @@ HTML;
     }
 
     /**
+     * 设置Word文档中所有表格居中对齐。
+     * 通过修改 <w:tblPr><w:jc> 为 center 来实现。
+     */
+    private function centerTablesInDocx(string $docxPath): void
+    {
+        if (!class_exists('ZipArchive')) {
+            Log::warning('ZipArchive not available, cannot center tables');
+            return;
+        }
+
+        $zip = new ZipArchive();
+        if ($zip->open($docxPath, ZipArchive::CREATE) !== true) {
+            Log::error('Failed to open docx file for centering tables', ['path' => $docxPath]);
+            return;
+        }
+
+        $documentXml = $zip->getFromName('word/document.xml');
+        if ($documentXml === false) {
+            $zip->close();
+            Log::error('word/document.xml not found in docx');
+            return;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadXML($documentXml);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+
+        $tables = $xpath->query('//w:tbl');
+        if ($tables->length === 0) {
+            $zip->close();
+            return;
+        }
+
+        $wNs = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+
+        foreach ($tables as $table) {
+            $tblPr = $xpath->query('w:tblPr', $table)->item(0);
+            if (!$tblPr) {
+                $tblPr = $dom->createElementNS($wNs, 'w:tblPr');
+                $table->insertBefore($tblPr, $table->firstChild);
+            }
+
+            $jc = $xpath->query('w:jc', $tblPr)->item(0);
+            if (!$jc) {
+                $jc = $dom->createElementNS($wNs, 'w:jc');
+                $tblPr->appendChild($jc);
+            }
+            $jc->setAttribute('w:val', 'center');
+        }
+
+        $newXml = $dom->saveXML();
+        $zip->addFromString('word/document.xml', $newXml);
+        $zip->close();
+
+        Log::info('Centered tables in docx', ['tables_count' => $tables->length, 'path' => $docxPath]);
+    }
+
+    /**
+     * 设置Word文档中所有标题居中对齐。
+     * 不依赖pandoc的居中设置，直接为所有标题样式设置居中。
+     */
+    private function centerHeadingsInDocx(string $docxPath): void
+    {
+        if (!class_exists('ZipArchive')) {
+            Log::warning('ZipArchive not available, cannot center headings');
+            return;
+        }
+
+        $zip = new ZipArchive();
+        if ($zip->open($docxPath, ZipArchive::CREATE) !== true) {
+            Log::error('Failed to open docx file for centering headings', ['path' => $docxPath]);
+            return;
+        }
+
+        $documentXml = $zip->getFromName('word/document.xml');
+        if ($documentXml === false) {
+            $zip->close();
+            Log::error('word/document.xml not found in docx');
+            return;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadXML($documentXml);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+
+        $wNs = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+        $centeredCount = 0;
+
+        $allParagraphs = $xpath->query('//w:p');
+        Log::info('centerHeadingsInDocx: found paragraphs', ['count' => $allParagraphs->length]);
+
+        foreach ($allParagraphs as $index => $paragraph) {
+            $pPr = $xpath->query('w:pPr', $paragraph)->item(0);
+            if (!$pPr) {
+                $pPr = $dom->createElementNS($wNs, 'w:pPr');
+                $paragraph->insertBefore($pPr, $paragraph->firstChild);
+            }
+
+            $pStyle = $xpath->query('w:pStyle', $pPr)->item(0);
+            $styleVal = $pStyle ? $pStyle->getAttribute('w:val') : '';
+
+            $textContent = '';
+            $textNodes = $xpath->query('.//w:t', $paragraph);
+            foreach ($textNodes as $t) {
+                $textContent .= $t->textContent;
+            }
+
+            $isHeadingStyle = strpos($styleVal, 'Heading') === 0 || $styleVal === 'Title' || $styleVal === 'Subtitle';
+
+            if ($isHeadingStyle) {
+                $jc = $xpath->query('w:jc', $pPr)->item(0);
+                if (!$jc) {
+                    $jc = $dom->createElementNS($wNs, 'w:jc');
+                    $pPr->appendChild($jc);
+                }
+                $jc->setAttribute('w:val', 'center');
+                $centeredCount++;
+                Log::info('centerHeadingsInDocx: centered heading', [
+                    'index' => $index,
+                    'style' => $styleVal,
+                    'text' => mb_substr($textContent, 0, 50)
+                ]);
+            }
+        }
+
+        $newXml = $dom->saveXML();
+        $zip->addFromString('word/document.xml', $newXml);
+        $zip->close();
+
+        Log::info('centerHeadingsInDocx: finished', ['centered_count' => $centeredCount, 'path' => $docxPath]);
+    }
+
+    /**
      * 为单个表格应用边框样式。
      * 为表格添加 <w:tblPr><w:tblBorders>，为每个单元格添加 <w:tcPr><w:tcBorders>。
      */
@@ -1464,13 +1607,19 @@ HTML;
         // ----- 3. 后处理：删除所有软回车 -----
         $this->removeSoftBreaksFromDocx($outputDocx);
 
-        // ----- 4. 后处理：强制设置第一个段落样式（居中、宋体、12pt、加粗）-----
+        // ----- 4. 后处理：设置所有标题居中 -----
+        $this->centerHeadingsInDocx($outputDocx);
+
+        // ----- 5. 后处理：强制设置第一个段落样式（居中、宋体、12pt、加粗）-----
         $this->applyFirstParagraphStyleToDocx($outputDocx);
 
-        // ----- 5. 后处理：为所有表格添加边框 -----
+        // ----- 6. 后处理：为所有表格添加边框 -----
         $this->addTableBordersToDocx($outputDocx);
 
-        // ----- 6. 验证输出文件 -----
+        // ----- 7. 后处理：设置所有表格居中 -----
+        $this->centerTablesInDocx($outputDocx);
+
+        // ----- 8. 验证输出文件 -----
         if (!file_exists($outputDocx) || filesize($outputDocx) === 0) {
             throw new \Exception('Generated Word document is empty or does not exist');
         }
@@ -1612,7 +1761,91 @@ HTML;
         
         return $innerHtml;
     }
-        
+
+    /**
+     * 将 HTML 片段中的第一个非空块级元素转换为居中的 H1 标题。
+     * 此方法用于在 removeFirstH1() 之后调用，将紧随其后的首个内容块作为文档标题展示。
+     * 会跳过所有空的块级元素，直到找到有实际内容的元素。
+     *
+     * @param string $html HTML 片段
+     * @return string 处理后的 HTML 片段
+     */
+    private function styleFirstElementAsHeading(string $html): string
+    {
+        if (!extension_loaded('dom')) {
+            return $html;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadHTML('<?xml encoding="utf-8"?>' . $html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        libxml_clear_errors();
+
+        $blockTags = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'pre', 'blockquote', 'table', 'ul', 'ol'];
+        $firstElement = null;
+        $skippedEmptyCount = 0;
+
+        $xpath = new \DOMXPath($dom);
+
+        foreach ($blockTags as $tag) {
+            $elements = $xpath->query('//' . $tag);
+            foreach ($elements as $element) {
+                if ($element->parentNode->nodeName === 'body' || $xpath->query('ancestor::body', $element)->length > 0) {
+                    $rawText = $element->textContent;
+                    $textContent = preg_replace('/\s+/', ' ', $rawText);
+                    $textContent = html_entity_decode($textContent, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                    $textContent = preg_replace('/[\x{00A0}\x{202F}\x{2000}-\x{200A}\x{200B}]/u', '', $textContent);
+                    $textContent = trim($textContent);
+
+                    if ($textContent === '' && $tag !== 'table') {
+                        $skippedEmptyCount++;
+                        continue;
+                    }
+
+                    $firstElement = $element;
+                    break 2;
+                }
+            }
+        }
+
+        if ($firstElement) {
+            $newElement = $dom->createElement('h1');
+            $newElement->setAttribute('style', 'text-align: center;');
+
+            foreach ($firstElement->attributes as $attr) {
+                if ($attr->name !== 'style' && $attr->name !== 'class') {
+                    $newElement->setAttribute($attr->name, $attr->value);
+                }
+            }
+
+            while ($firstElement->firstChild) {
+                $newElement->appendChild($firstElement->firstChild);
+            }
+
+            $firstElement->parentNode->replaceChild($newElement, $firstElement);
+
+            Log::info('styleFirstElementAsHeading: converted to centered H1', [
+                'tag' => $newElement->tagName,
+                'content' => mb_substr(trim($newElement->textContent), 0, 50),
+                'skipped_empty_count' => $skippedEmptyCount
+            ]);
+        } else {
+            Log::warning('styleFirstElementAsHeading: 未找到有内容的块级元素', [
+                'html_sample' => mb_substr($html, 0, 300)
+            ]);
+        }
+
+        $innerHtml = '';
+        foreach ($dom->childNodes as $child) {
+            if ($child instanceof \DOMProcessingInstruction) {
+                continue;
+            }
+            $innerHtml .= $dom->saveHTML($child);
+        }
+
+        return $innerHtml;
+    }
+
 
     /**
      * 强制设置 docx 中第一个段落为：居中、宋体、18pt（小二）、加粗。
@@ -1655,8 +1888,16 @@ HTML;
         }
         $firstP = $paragraphs->item(0);
 
-        // ----- 2. 确保 <w:pPr> 存在并设置居中对齐 -----
+        // ----- 2. 检查第一个段落是否是标题样式 -----
         $pPr = $xpath->query('w:pPr', $firstP)->item(0);
+        $pStyle = $pPr ? $xpath->query('w:pStyle', $pPr)->item(0) : null;
+        $styleVal = $pStyle ? $pStyle->getAttribute('w:val') : '';
+        $isHeadingStyle = strpos($styleVal, 'Heading') === 0 || $styleVal === 'Title' || $styleVal === 'Subtitle';
+
+        // 如果是标题样式，已由 centerHeadingsInDocx 处理，只设置居中即可
+        // 如果不是标题样式，则应用首行样式
+
+        // ----- 3. 确保 <w:pPr> 存在并设置居中对齐 -----
         if (!$pPr) {
             $pPr = $dom->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:pPr');
             $firstP->insertBefore($pPr, $firstP->firstChild);
@@ -1670,24 +1911,27 @@ HTML;
         }
         $jc->setAttribute('w:val', 'center');
 
-        // ----- 3. 段落默认字符属性（用于没有直接格式的文本）-----
-        $pRPr = $xpath->query('w:rPr', $pPr)->item(0);
-        if (!$pRPr) {
-            $pRPr = $dom->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:rPr');
-            $pPr->appendChild($pRPr);
-        }
-        // 设置段落默认字体、字号、加粗（18pt = w:sz 36）
-        $this->setRunProperties($pRPr, '36', 'SimSun', '宋体', true);
-
-        // ----- 4. 遍历所有 <w:r> 运行，强制设置相同的属性（覆盖 Pandoc 内联样式）-----
-        $runs = $xpath->query('.//w:r', $firstP);
-        foreach ($runs as $run) {
-            $rPr = $xpath->query('w:rPr', $run)->item(0);
-            if (!$rPr) {
-                $rPr = $dom->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:rPr');
-                $run->insertBefore($rPr, $run->firstChild);
+        // ----- 4. 只有非标题段落才应用字体样式 -----
+        if (!$isHeadingStyle) {
+            // 段落默认字符属性（用于没有直接格式的文本）
+            $pRPr = $xpath->query('w:rPr', $pPr)->item(0);
+            if (!$pRPr) {
+                $pRPr = $dom->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:rPr');
+                $pPr->appendChild($pRPr);
             }
-            $this->setRunProperties($rPr, '36', 'SimSun', '宋体', true);
+            // 设置段落默认字体、字号、加粗（18pt = w:sz 36）
+            $this->setRunProperties($pRPr, '36', 'SimSun', '宋体', true);
+
+            // 遍历所有 <w:r> 运行，强制设置相同的属性（覆盖 Pandoc 内联样式）
+            $runs = $xpath->query('.//w:r', $firstP);
+            foreach ($runs as $run) {
+                $rPr = $xpath->query('w:rPr', $run)->item(0);
+                if (!$rPr) {
+                    $rPr = $dom->createElementNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'w:rPr');
+                    $run->insertBefore($rPr, $run->firstChild);
+                }
+                $this->setRunProperties($rPr, '36', 'SimSun', '宋体', true);
+            }
         }
 
         // ----- 5. 保存修改后的 XML -----
@@ -1695,7 +1939,7 @@ HTML;
         $zip->addFromString('word/document.xml', $newXml);
         $zip->close();
 
-        // Log::info('Applied first paragraph style to docx (18pt, SimSun, bold, centered)', ['path' => $docxPath]);
+        Log::info('Applied first paragraph style to docx', ['is_heading' => $isHeadingStyle, 'path' => $docxPath]);
     }
 
     /**
@@ -1896,7 +2140,6 @@ HTML;
     .page-content td {
         border: 1px solid #000000;
         padding: 8px 12px;
-        text-align: left;
     }
     .page-content th {
         background-color: #f2f2f2;
@@ -1947,7 +2190,24 @@ HTML;
     pre {
         white-space: pre-wrap;
     }
-    CSS;
+
+    /* 表格居中处理 - 支持 align="center" 属性 */
+    div[align="center"] table {
+        margin-left: auto;
+        margin-right: auto;
+    }
+
+    /* 单元格文字居中处理 - 支持 align="center" 属性 */
+    td[align="center"], th[align="center"] {
+        text-align: center !important;
+    }
+
+    /* 表格整体居中 */
+    table[align="center"] {
+        margin-left: auto !important;
+        margin-right: auto !important;
+    }
+CSS;
 
         // ----- 终极强制表格边框实线（类优先级 + !important）-----
         $ultimates = <<<CSS
