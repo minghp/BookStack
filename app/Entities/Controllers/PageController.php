@@ -188,21 +188,21 @@ class PageController extends Controller
         $this->checkOwnablePermission(Permission::PageView, $page);
 
         try {
-            // Get page HTML content
-            $pageContent = (new PageContent($page));
-            $page->html = $pageContent->render();
-            
-            // Create temporary files
             $tempDir = sys_get_temp_dir();
-            $tempHtml = $this->createTempHtmlFile($page, $tempDir);
             $tempDocx = tempnam($tempDir, 'bookstack_word_') . '.docx';
-            
-            // Convert HTML to DOCX using pandoc
-            $this->convertHtmlToDocx($tempHtml, $tempDocx);
-            
-            // Return file download
+
+            if (!empty($page->markdown)) {
+                $tempMarkdown = $this->createTempMarkdownFile($page, $tempDir);
+                $this->convertMarkdownToDocx($tempMarkdown, $tempDocx);
+            } else {
+                $pageContent = (new PageContent($page));
+                $page->html = $pageContent->render();
+                $tempHtml = $this->createTempHtmlFile($page, $tempDir);
+                $this->convertHtmlToDocx($tempHtml, $tempDocx);
+            }
+
             return $this->sendDocxDownload($tempDocx, $page);
-            
+
         } catch (NotFoundException $e) {
             throw $e;
         } catch (\Exception $e) {
@@ -210,9 +210,534 @@ class PageController extends Controller
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString()
             ]);
-            
+
             return redirect($page->getUrl())
                 ->with('error', trans('errors.export_word_failed') . ': ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Create temporary Markdown file for export.
+     */
+    private function createTempMarkdownFile($page, string $tempDir): string
+    {
+        $markdownContent = $this->buildExportMarkdown($page);
+
+        $tempFile = tempnam($tempDir, 'bookstack_md_') . '.md';
+        file_put_contents($tempFile, $markdownContent);
+
+        return $tempFile;
+    }
+
+    /**
+     * Build Markdown content for export.
+     */
+    private function buildExportMarkdown($page): string
+    {
+        $markdown = $page->markdown ?? '';
+
+        Log::info('Building export markdown', ['has_markdown' => !empty($markdown), 'html_length' => strlen($page->html ?? ''), 'md_length' => strlen($markdown)]);
+
+        if (strpos($markdown, '<table') !== false) {
+            Log::info('Found HTML table in markdown content before conversion');
+        }
+
+        $markdown = $this->convertHtmlTablesToMarkdown($markdown);
+
+        if (strpos($markdown, '<table') !== false) {
+            Log::warning('HTML table still present after conversion attempt');
+        }
+
+        $markdown = $this->removeFirstH1FromMarkdown($markdown);
+        $markdown = $this->normalizeMarkdownContent($markdown);
+        $markdown = $this->replaceNonBreakingSpacesInMarkdown($markdown);
+        $markdown = $this->convertCheckboxesInMarkdown($markdown);
+
+        return "# " . $page->name . "\n\n" . $markdown;
+    }
+
+    /**
+     * Convert checkbox Unicode characters in Markdown to Word-compatible format.
+     * Uses HTML character references to avoid encoding issues during Pandoc conversion.
+     */
+    private function convertCheckboxesInMarkdown(string $markdown): string
+    {
+        $checkboxMappings = [
+            '☐' => '&#9744;',
+            '☒' => '&#9746;',
+            '☑' => '&#9745;',
+            '☸' => '&#9784;',
+            '○' => '&#9675;',
+            '●' => '&#9679;',
+            '◉' => '&#9673;',
+            '✅' => '&#9989;',
+            '❌' => '&#10060;',
+        ];
+
+        foreach ($checkboxMappings as $unicode => $htmlEntity) {
+            $markdown = str_replace($unicode, $htmlEntity, $markdown);
+        }
+
+        return $markdown;
+    }
+
+    /**
+     * Convert HTML tables to Markdown tables.
+     */
+    private function convertHtmlTablesToMarkdown(string $markdown): string
+    {
+        if (!extension_loaded('dom')) {
+            return $markdown;
+        }
+
+        $pattern = '/<table[^>]*>[\s\S]*?<\/table>/i';
+        $convertedCount = 0;
+
+        $result = preg_replace_callback($pattern, function ($matches) use (&$convertedCount) {
+            $htmlTable = $matches[0];
+            $converted = $this->convertSingleHtmlTableToMarkdown($htmlTable);
+            if ($converted !== $htmlTable) {
+                $convertedCount++;
+                Log::info('Converted HTML table to Markdown', ['table_length' => strlen($htmlTable)]);
+            }
+            return $converted;
+        }, $markdown);
+
+        if ($convertedCount > 0) {
+            Log::info("Successfully converted $convertedCount HTML table(s) to Markdown");
+        }
+
+        return $result;
+    }
+
+    /**
+     * Convert a single HTML table to Markdown format.
+     * Handles complex tables with rowspan and nested elements.
+     */
+    private function convertSingleHtmlTableToMarkdown(string $htmlTable): string
+    {
+        try {
+            $dom = new \DOMDocument();
+            libxml_use_internal_errors(true);
+            $dom->loadHTML('<?xml encoding="utf-8"?>' . $htmlTable, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+            libxml_clear_errors();
+
+            $tables = $dom->getElementsByTagName('table');
+            if ($tables->length === 0) {
+                return $htmlTable;
+            }
+
+            $table = $tables->item(0);
+            
+            // 查找所有行（包括thead和tbody中的行）
+            $allRows = [];
+            $thead = $table->getElementsByTagName('thead')->item(0);
+            $tbody = $table->getElementsByTagName('tbody')->item(0);
+            
+            if ($thead) {
+                foreach ($thead->getElementsByTagName('tr') as $tr) {
+                    $allRows[] = $tr;
+                }
+            }
+            if ($tbody) {
+                foreach ($tbody->getElementsByTagName('tr') as $tr) {
+                    $allRows[] = $tr;
+                }
+            }
+            
+            // 如果没有找到thead/tbody，直接查找tr
+            if (empty($allRows)) {
+                foreach ($table->getElementsByTagName('tr') as $tr) {
+                    $allRows[] = $tr;
+                }
+            }
+
+            if (empty($allRows)) {
+                return $htmlTable;
+            }
+
+            // 计算最大列数
+            $maxCols = 0;
+            foreach ($allRows as $row) {
+                $cols = 0;
+                $cells = $row->getElementsByTagName('th');
+                if ($cells->length === 0) {
+                    $cells = $row->getElementsByTagName('td');
+                }
+                foreach ($cells as $cell) {
+                    $colspan = intval($cell->getAttribute('colspan')) ?: 1;
+                    $cols += $colspan;
+                }
+                $maxCols = max($maxCols, $cols);
+            }
+
+            // 处理 rowspan - 跟踪需要在下一行填充的单元格
+            $pendingRowspans = [];
+            $markdownRows = [];
+            $headerProcessed = false;
+
+            foreach ($allRows as $rowIndex => $row) {
+                $cells = $row->getElementsByTagName('th');
+                if ($cells->length === 0) {
+                    $cells = $row->getElementsByTagName('td');
+                }
+
+                // 将 DOMNodeList 转为数组以便索引访问
+                $cellsArray = [];
+                foreach ($cells as $cell) {
+                    $cellsArray[] = $cell;
+                }
+
+                $cellContents = [];
+                $cellIndex = 0;
+                $col = 0;
+
+                // 逐列构建行内容，正确处理 rowspan 占位列
+                while ($col < $maxCols) {
+                    // 检查当前列是否被上一行的 rowspan 占据
+                    if (isset($pendingRowspans[$col]) && $pendingRowspans[$col] > 0) {
+                        $cellContents[] = '';
+                        $pendingRowspans[$col]--;
+                        $col++;
+                        continue;
+                    }
+
+                    // 处理当前行的实际单元格
+                    if ($cellIndex < count($cellsArray)) {
+                        $cell = $cellsArray[$cellIndex];
+                        $cellText = trim($this->getElementTextWithBreaks($cell));
+                        $cellText = str_replace(['|', '\n', '\r'], ['\\|', ' ', ' '], $cellText);
+                        $cellContents[] = $cellText;
+
+                        $colspan = intval($cell->getAttribute('colspan')) ?: 1;
+                        $rowspan = intval($cell->getAttribute('rowspan')) ?: 1;
+
+                        // 处理 colspan - 为额外列添加空单元格
+                        for ($i = 1; $i < $colspan; $i++) {
+                            $col++;
+                            $cellContents[] = '';
+                        }
+
+                        // 处理 rowspan - 记录到 pendingRowspans 供后续行使用
+                        if ($rowspan > 1) {
+                            $pendingRowspans[$col] = $rowspan - 1;
+                        }
+
+                        $cellIndex++;
+                        $col++;
+                    } else {
+                        // 当前行没有更多单元格，剩余列填充空值
+                        $cellContents[] = '';
+                        $col++;
+                    }
+                }
+
+                $markdownRows[] = '| ' . implode(' | ', $cellContents) . ' |';
+
+                // 添加表头分隔行
+                if (!$headerProcessed && $row->getElementsByTagName('th')->length > 0) {
+                    $separatorCells = array_fill(0, $maxCols, '---');
+                    $markdownRows[] = '| ' . implode(' | ', $separatorCells) . ' |';
+                    $headerProcessed = true;
+                }
+            }
+
+            return "\n" . implode("\n", $markdownRows) . "\n";
+        } catch (\Exception $e) {
+            Log::warning('Failed to convert HTML table to Markdown: ' . $e->getMessage());
+            return $htmlTable;
+        }
+    }
+
+    /**
+     * Get text content from a DOM element, including nested elements.
+     * Converts <br> tags to spaces.
+     */
+    private function getElementTextWithBreaks(\DOMElement $element): string
+    {
+        $text = '';
+        foreach ($element->childNodes as $child) {
+            if ($child instanceof \DOMText) {
+                $text .= $child->nodeValue;
+            } elseif ($child instanceof \DOMElement) {
+                if (strtolower($child->tagName) === 'br') {
+                    $text .= ' ';
+                } else {
+                    $text .= $this->getElementTextWithBreaks($child);
+                }
+            }
+        }
+        return $text;
+    }
+
+    /**
+     * Remove first h1 heading from markdown content.
+     */
+    private function removeFirstH1FromMarkdown(string $markdown): string
+    {
+        $lines = explode("\n", $markdown);
+        $firstLineRemoved = false;
+
+        $filtered = array_filter($lines, function ($line) use (&$firstLineRemoved) {
+            if (!$firstLineRemoved && preg_match('/^#\s+/', $line)) {
+                $firstLineRemoved = true;
+                return false;
+            }
+            return true;
+        });
+
+        return implode("\n", array_values($filtered));
+    }
+
+    /**
+     * Normalize markdown content for pandoc conversion.
+     * Handles encoding issues, line endings, and preserves markdown structure.
+     */
+    private function normalizeMarkdownContent(string $markdown): string
+    {
+        if (empty($markdown)) {
+            return $markdown;
+        }
+
+        $markdown = $this->normalizeLineEndings($markdown);
+
+        $markdown = $this->decodeHtmlEntities($markdown);
+
+        $markdown = $this->preserveTreeStructures($markdown);
+
+        $markdown = $this->fixMarkdownStructure($markdown);
+
+        $markdown = $this->preserveCodeBlocks($markdown);
+
+        return $markdown;
+    }
+
+    /**
+     * Detect and wrap tree/directory structures in code blocks to preserve formatting.
+     * Tree structures typically use patterns like:
+     *   |-- filename
+     *   |   |-- subdir
+     *   `-- file.txt
+     */
+    private function preserveTreeStructures(string $markdown): string
+    {
+        $lines = explode("\n", $markdown);
+        $result = [];
+        $inTreeBlock = false;
+        $treeBlockLines = [];
+        $codeBlockDepth = 0;
+        $previousLine = '';
+
+        foreach ($lines as $line) {
+            if (preg_match('/^```/', $line)) {
+                $codeBlockDepth = ($codeBlockDepth + 1) % 2;
+                $result[] = $line;
+                $previousLine = '';
+                continue;
+            }
+
+            if ($codeBlockDepth > 0) {
+                $result[] = $line;
+                $previousLine = '';
+                continue;
+            }
+
+            $isTreeLine = $this->isTreeStructureLine($line);
+
+            if ($isTreeLine && !$inTreeBlock) {
+                $inTreeBlock = true;
+                $treeBlockLines = [];
+                if ($previousLine !== '' && trim($previousLine) !== '') {
+                    $treeBlockLines[] = $previousLine;
+                }
+            }
+
+            if ($inTreeBlock) {
+                $treeBlockLines[] = $line;
+                if (!$isTreeLine && trim($line) !== '') {
+                    $result[] = "```\n" . implode("\n", $treeBlockLines) . "\n```";
+                    $treeBlockLines = [];
+                    $inTreeBlock = false;
+                    $previousLine = '';
+                } elseif (!$isTreeLine && trim($line) === '') {
+                    $treeBlockLines[] = $line;
+                } else {
+                    $previousLine = '';
+                }
+            } else {
+                $result[] = $line;
+                $previousLine = $line;
+            }
+        }
+
+        if (!empty($treeBlockLines)) {
+            $result[] = "```\n" . implode("\n", $treeBlockLines) . "\n```";
+        }
+
+        return implode("\n", $result);
+    }
+
+    /**
+     * Check if a line is part of a tree/directory structure.
+     * Supports various tree formats including leading whitespace.
+     * Distinguishes between tree syntax (|--, |   --, `--) and table syntax (| content |).
+     */
+    private function isTreeStructureLine(string $line): bool
+    {
+        $trimmed = trim($line);
+
+        if ($trimmed === '') {
+            return false;
+        }
+
+        if (preg_match('/^\|$/', $trimmed)) {
+            return true;
+        }
+
+        if (preg_match('/^(\s*)-- /', $trimmed)) {
+            return true;
+        }
+
+        if (preg_match('/^(\s*)\|(\s)-- /', $trimmed)) {
+            return true;
+        }
+
+        if (preg_match('/^(\s*)\|(\s{2,})-- /', $trimmed)) {
+            return true;
+        }
+
+        if (preg_match('/^(\s*)`-- /', $trimmed)) {
+            return true;
+        }
+
+        if (preg_match('/^\s*\|$/U', $line)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Normalize line endings to Unix style (\n).
+     */
+    private function normalizeLineEndings(string $markdown): string
+    {
+        $markdown = str_replace(["\r\n", "\r"], "\n", $markdown);
+        return $markdown;
+    }
+
+    /**
+     * Decode HTML entities that might interfere with pandoc parsing.
+     * Only decodes entities that are safe for markdown processing.
+     */
+    private function decodeHtmlEntities(string $markdown): string
+    {
+        $markdown = html_entity_decode($markdown, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+        $markdown = str_replace(['&lt;', '&gt;', '&amp;', '&quot;'], ['<', '>', '&', '"'], $markdown);
+
+        return $markdown;
+    }
+
+    /**
+     * Fix common markdown structure issues.
+     * Ensures proper spacing around headers, lists, and code blocks.
+     */
+    private function fixMarkdownStructure(string $markdown): string
+    {
+        $lines = explode("\n", $markdown);
+        $fixedLines = [];
+
+        foreach ($lines as $line) {
+            $trimmed = trim($line);
+
+            if (preg_match('/^#{1,6}\s+.*$/', $trimmed)) {
+                $fixedLines[] = $trimmed;
+            } elseif (preg_match('/^[\*\-\+]\s+.*$/', $trimmed) || preg_match('/^\d+\.\s+.*$/', $trimmed)) {
+                $fixedLines[] = $trimmed;
+            } elseif (preg_match('/^```/', $trimmed)) {
+                $fixedLines[] = $trimmed;
+            } elseif ($trimmed !== '') {
+                $fixedLines[] = $line;
+            } else {
+                $fixedLines[] = $line;
+            }
+        }
+
+        return implode("\n", $fixedLines);
+    }
+
+    /**
+     * Preserve code block markers by ensuring proper line breaks.
+     */
+    private function preserveCodeBlocks(string $markdown): string
+    {
+        $inCodeBlock = false;
+        $lines = explode("\n", $markdown);
+        $result = [];
+
+        foreach ($lines as $line) {
+            if (preg_match('/^```/', $line)) {
+                $inCodeBlock = !$inCodeBlock;
+                $result[] = $line;
+            } elseif (!$inCodeBlock && trim($line) !== '' && !preg_match('/^#{1,6}\s+.*$/', trim($line)) && !preg_match('/^[\*\-\+]\s+.*$/', trim($line)) && !preg_match('/^\d+\.\s+.*$/', trim($line))) {
+                $result[] = $line;
+            } else {
+                $result[] = $line;
+            }
+        }
+
+        return implode("\n", $result);
+    }
+
+    /**
+     * Replace non-breaking spaces in markdown content.
+     */
+    private function replaceNonBreakingSpacesInMarkdown(string $markdown): string
+    {
+        $markdown = str_replace(['&nbsp;', '&#160;', '&#xA0;'], ' ', $markdown);
+        $markdown = str_replace("\xC2\xA0", ' ', $markdown);
+        return $markdown;
+    }
+
+    /**
+     * Convert Markdown to DOCX using pandoc.
+     */
+    private function convertMarkdownToDocx(string $inputMarkdown, string $outputDocx): void
+    {
+        $command = [
+            'pandoc',
+            $inputMarkdown,
+            '-o', $outputDocx,
+            '--resource-path=' . dirname($inputMarkdown),
+            '--self-contained',
+            '--from=markdown',
+            '--wrap=preserve',
+            '--standalone',
+        ];
+
+        $templatePath = config('app.word_export_template', '/app/medical_device_template.docx');
+        if (file_exists($templatePath)) {
+            $command[] = '--reference-doc=' . $templatePath;
+        }
+
+        $process = new Process($command);
+        $process->setTimeout(300);
+        $process->run();
+
+        if (file_exists($inputMarkdown)) {
+            @unlink($inputMarkdown);
+        }
+
+        if (!$process->isSuccessful()) {
+            throw new ProcessFailedException($process);
+        }
+
+        $this->removeSoftBreaksFromDocx($outputDocx);
+        $this->addTableBordersToDocx($outputDocx);
+
+        if (!file_exists($outputDocx) || filesize($outputDocx) === 0) {
+            throw new \Exception('Generated Word document is empty or does not exist');
         }
     }
 
@@ -258,7 +783,16 @@ class PageController extends Controller
         // 5. 移除不存在的图片（防止 pandoc 报错）
         $htmlContent = $this->removeInvalidImages($htmlContent);
 
-        // 6. 构建最终 HTML
+        // 6. 转换勾选框字符为 Word 兼容格式
+        $htmlContent = $this->convertCheckboxesForWord($htmlContent);
+
+        // 7. 转换字母列表项为 HTML 列表格式
+        $htmlContent = $this->convertLetterListsToHtml($htmlContent);
+
+        // 8. 处理 br 标签，转换为独立段落以保留换行
+        $htmlContent = $this->convertBrTagsToParagraphs($htmlContent);
+
+        // 9. 构建最终 HTML
         $exportStyles = $this->getExportStyles();
         
 
@@ -381,6 +915,315 @@ HTML;
         }
 
         return public_path($src);
+    }
+
+    /**
+     * 将 HTML 中的 Unicode 勾选框字符转换为 Word/WPS 兼容的格式。
+     * Unicode 勾选框字符（☐☒☑）在转换后可能显示为 £ 或 R 等错误符号，
+     * 此方法通过使用 HTML 字符引用来避免编码问题。
+     * 同时处理 HTML checkbox input 元素和 Wingdings 字体符号。
+     *
+     * @param string $html HTML 片段
+     * @return string 处理后的 HTML
+     */
+    private function convertCheckboxesForWord(string $html): string
+    {
+        $html = $this->convertCheckboxInputsToCharacters($html);
+        $html = $this->convertWingdingsCheckboxesToCharacters($html);
+
+        $checkboxMappings = [
+            '☐' => '&#9744;',
+            '☒' => '&#9746;',
+            '☑' => '&#9745;',
+            '☸' => '&#9784;',
+            '○' => '&#9675;',
+            '●' => '&#9679;',
+            '◉' => '&#9673;',
+            '✅' => '&#9989;',
+            '❌' => '&#10060;',
+        ];
+
+        foreach ($checkboxMappings as $unicode => $htmlEntity) {
+            $html = str_replace($unicode, $htmlEntity, $html);
+        }
+
+        return $html;
+    }
+
+    /**
+     * 将 Wingdings/Wingdings 2 字体的勾选框符号转换为标准 Unicode 字符。
+     * Wingdings 2 中：£/O = 空心方框(未勾选), R = 打勾方框, P = 打叉方框
+     *
+     * @param string $html HTML 片段
+     * @return string 处理后的 HTML
+     */
+    private function convertWingdingsCheckboxesToCharacters(string $html): string
+    {
+        $html = $this->replaceNestedWingdingsCheckboxes($html);
+
+        $charToEntity = [
+            'R' => '&#9745;',
+            '£' => '&#9744;',
+            'O' => '&#9744;',
+            'P' => '&#9746;',
+        ];
+
+        foreach ($charToEntity as $char => $entity) {
+            $escapedChar = preg_quote($char, '/');
+            $html = preg_replace('/<span[^>]*mso-symbol-font-family:\s*["\']Wingdings 2?["\'][^>]*>' . $escapedChar . '<\/span>/i', $entity, $html);
+            $html = preg_replace('/<span[^>]*font-family:\s*["\']Wingdings 2?["\'][^>]*>' . $escapedChar . '<\/span>/i', $entity, $html);
+        }
+
+        return $html;
+    }
+
+    /**
+     * 处理嵌套的 Wingdings 勾选框 span 结构。
+     * 将包含 £/O/R/P 字符及其父级 Wingdings span 一起替换。
+     *
+     * @param string $html HTML 片段
+     * @return string 处理后的 HTML
+     */
+    private function replaceNestedWingdingsCheckboxes(string $html): string
+    {
+        $charToEntity = [
+            'R' => '&#9745;',
+            '£' => '&#9744;',
+            'O' => '&#9744;',
+            'P' => '&#9746;',
+        ];
+
+        foreach ($charToEntity as $char => $entity) {
+            $escapedChar = preg_quote($char, '/');
+            $pattern = '/(<span[^>]*mso-symbol-font-family:\s*["\']Wingdings 2?["\'][^>]*>)<span[^>]*>' . $escapedChar . '<\/span>(<\/span>)/i';
+            $html = preg_replace($pattern, $entity, $html);
+
+            $pattern = '/(<span[^>]*font-family:\s*["\']Wingdings 2?["\'][^>]*>)<span[^>]*>' . $escapedChar . '<\/span>(<\/span>)/i';
+            $html = preg_replace($pattern, $entity, $html);
+        }
+
+        return $html;
+    }
+
+    /**
+     * 将 HTML checkbox input 元素转换为 Unicode 字符。
+     * checked 状态的 checkbox 转换为 ☑，unchecked 转换为 ☐。
+     *
+     * @param string $html HTML 片段
+     * @return string 处理后的 HTML
+     */
+    private function convertCheckboxInputsToCharacters(string $html): string
+    {
+        $html = preg_replace('/<input[^>]*type=["\']checkbox["\'][^>]*checked[^>]*>/i', '☑', $html);
+        $html = preg_replace('/<input[^>]*type=["\']checkbox["\'][^>]*>/i', '☐', $html);
+
+        return $html;
+    }
+
+    /**
+     * 将字母列表项（a), b), c) 等）转换为 HTML 有序列表格式。
+     * 确保 Pandoc 转换时保留列表结构和换行。
+     *
+     * @param string $html HTML 片段
+     * @return string 处理后的 HTML
+     */
+    private function convertLetterListsToHtml(string $html): string
+    {
+        if (!extension_loaded('dom')) {
+            return $html;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadHTML('<?xml encoding="UTF-8">' . $html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        $paragraphs = $xpath->query('//p[contains(text(), ")")]');
+
+        if ($paragraphs->length < 2) {
+            return $html;
+        }
+
+        $listItems = [];
+        $listStartIndex = -1;
+
+        foreach ($paragraphs as $index => $p) {
+            $text = trim($p->textContent);
+            if (preg_match('/^([a-z])\)\s*/i', $text, $matches)) {
+                if ($listStartIndex === -1) {
+                    $listStartIndex = $index;
+                }
+                $content = preg_replace('/^[a-z]\)\s*/i', '', $text);
+                $listItems[] = [
+                    'index' => $index,
+                    'content' => $content,
+                    'letter' => strtolower($matches[1])
+                ];
+            } else {
+                if (count($listItems) >= 2) {
+                    break;
+                }
+                $listItems = [];
+                $listStartIndex = -1;
+            }
+        }
+
+        if (count($listItems) < 2) {
+            return $html;
+        }
+
+        $ol = $dom->createElement('ol');
+        $ol->setAttribute('type', 'a');
+
+        foreach ($listItems as $item) {
+            $li = $dom->createElement('li');
+            $liText = $dom->createTextNode($item['content']);
+            $li->appendChild($liText);
+            $ol->appendChild($li);
+        }
+
+        $firstItem = $listItems[0]['index'];
+        $p = $paragraphs->item($firstItem);
+        $p->parentNode->insertBefore($ol, $p);
+
+        foreach ($listItems as $item) {
+            $p = $paragraphs->item($item['index']);
+            if ($p->parentNode) {
+                $p->parentNode->removeChild($p);
+            }
+        }
+
+        $body = $xpath->query('//body')->item(0);
+        if ($body) {
+            $innerHtml = '';
+            foreach ($body->childNodes as $child) {
+                $innerHtml .= $dom->saveHTML($child);
+            }
+            return $innerHtml;
+        }
+
+        return $dom->saveHTML();
+    }
+
+    /**
+     * 将 <p> 标签内的 <br> 标签转换为独立段落，以保留换行结构。
+     * 处理包含字母列表项（a), b), c) 等）的段落。
+     *
+     * @param string $html HTML 片段
+     * @return string 处理后的 HTML
+     */
+    private function convertBrTagsToParagraphs(string $html): string
+    {
+        if (strpos($html, '<br') === false) {
+            return $html;
+        }
+
+        if (!extension_loaded('dom')) {
+            return $html;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadHTML('<?xml encoding="UTF-8">' . $html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        $paragraphs = $xpath->query('//p[br]');
+
+        if ($paragraphs->length === 0) {
+            return $html;
+        }
+
+        $modified = false;
+
+        foreach ($paragraphs as $p) {
+            $innerHtml = $dom->saveHTML($p);
+
+            if (preg_match_all('/<br\s*\/?>/i', $innerHtml, $brMatches)) {
+                $parts = preg_split('/<br\s*\/?>/i', $innerHtml);
+
+                if (count($parts) < 2) {
+                    continue;
+                }
+
+                $listItems = [];
+                $headingText = '';
+                $nonListParts = [];
+
+                foreach ($parts as $part) {
+                    $part = trim($part);
+                    $part = preg_replace('/^<p[^>]*>/', '', $part);
+                    $part = preg_replace('/<\/p>$/', '', $part);
+
+                    if (empty($part)) {
+                        continue;
+                    }
+
+                    if (preg_match('/^<span[^>]*>3\.\d+/', $part)) {
+                        $headingText = strip_tags($part);
+                        continue;
+                    }
+
+                    if (preg_match('/^[a-z]\)/i', trim($part))) {
+                        $listItems[] = trim(strip_tags($part));
+                    } else {
+                        $text = trim(strip_tags($part));
+                        if (!empty($text) && !preg_match('/^[a-z]\)/i', $text)) {
+                            $nonListParts[] = $text;
+                        }
+                    }
+                }
+
+                if (count($listItems) >= 2) {
+                    $parent = $p->parentNode;
+                    $nextSibling = $p->nextSibling;
+
+                    if (!empty($headingText)) {
+                        $headingP = $dom->createElement('p');
+                        $headingTextNode = $dom->createTextNode($headingText);
+                        $headingP->appendChild($headingTextNode);
+                        $parent->insertBefore($headingP, $nextSibling);
+                    }
+
+                    if (!empty($nonListParts)) {
+                        foreach ($nonListParts as $text) {
+                            $textP = $dom->createElement('p');
+                            $textNode = $dom->createTextNode($text);
+                            $textP->appendChild($textNode);
+                            $parent->insertBefore($textP, $nextSibling);
+                        }
+                    }
+
+                    $ol = $dom->createElement('ol');
+                    $ol->setAttribute('type', 'a');
+
+                    foreach ($listItems as $item) {
+                        $li = $dom->createElement('li');
+                        $liText = $dom->createTextNode($item);
+                        $li->appendChild($liText);
+                        $ol->appendChild($li);
+                    }
+
+                    $parent->insertBefore($ol, $nextSibling);
+                    $parent->removeChild($p);
+                    $modified = true;
+                }
+            }
+        }
+
+        if ($modified) {
+            $body = $xpath->query('//body')->item(0);
+            if ($body) {
+                $innerHtml = '';
+                foreach ($body->childNodes as $child) {
+                    $innerHtml .= $dom->saveHTML($child);
+                }
+                return $innerHtml;
+            }
+        }
+
+        return $html;
     }
 
     /**
@@ -518,6 +1361,12 @@ HTML;
             $table->insertBefore($tblPr, $table->firstChild);
         }
 
+        // 禁用表格跨页时重复表头 - 删除 w:tblHeader 元素
+        $tblHeader = $xpath->query('w:tblHeader', $tblPr)->item(0);
+        if ($tblHeader) {
+            $tblPr->removeChild($tblHeader);
+        }
+
         $tblBorders = $xpath->query('w:tblBorders', $tblPr)->item(0);
         if (!$tblBorders) {
             $tblBorders = $dom->createElementNS($wNs, 'w:tblBorders');
@@ -586,7 +1435,7 @@ HTML;
             '-o', $outputDocx,
             '--resource-path=' . dirname($inputHtml),
             '--self-contained',
-            '--wrap=none',
+            '--wrap=preserve',
             '--standalone',
         ];
 
