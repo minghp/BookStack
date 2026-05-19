@@ -192,8 +192,18 @@ class PageController extends Controller
             $tempDocx = tempnam($tempDir, 'bookstack_word_') . '.docx';
 
             if (!empty($page->markdown)) {
-                $tempMarkdown = $this->createTempMarkdownFile($page, $tempDir);
-                $this->convertMarkdownToDocx($tempMarkdown, $tempDocx);
+                $markdownContent = $this->buildExportMarkdown($page);
+
+                if ($this->hasComplexHtmlTables($page->markdown)) {
+                    Log::info('Using HTML export path due to complex table structure (rowspan/colspan)');
+                    $pageContent = (new PageContent($page));
+                    $page->html = $pageContent->render();
+                    $tempHtml = $this->createTempHtmlFile($page, $tempDir);
+                    $this->convertHtmlToDocx($tempHtml, $tempDocx);
+                } else {
+                    $tempMarkdown = $this->createTempMarkdownFileFromContent($markdownContent, $tempDir);
+                    $this->convertMarkdownToDocx($tempMarkdown, $tempDocx);
+                }
             } else {
                 $pageContent = (new PageContent($page));
                 $page->html = $pageContent->render();
@@ -217,7 +227,7 @@ class PageController extends Controller
     }
 
     /**
-     * Create temporary Markdown file for export.
+     * Create temporary Markdown file for export from page.
      */
     private function createTempMarkdownFile($page, string $tempDir): string
     {
@@ -225,6 +235,17 @@ class PageController extends Controller
 
         $tempFile = tempnam($tempDir, 'bookstack_md_') . '.md';
         file_put_contents($tempFile, $markdownContent);
+
+        return $tempFile;
+    }
+
+    /**
+     * Create temporary Markdown file from content string.
+     */
+    private function createTempMarkdownFileFromContent(string $content, string $tempDir): string
+    {
+        $tempFile = tempnam($tempDir, 'bookstack_md_') . '.md';
+        file_put_contents($tempFile, $content);
 
         return $tempFile;
     }
@@ -242,6 +263,11 @@ class PageController extends Controller
             Log::info('Found HTML table in markdown content before conversion');
         }
 
+        if ($this->hasComplexHtmlTables($markdown)) {
+            Log::info('HTML table contains rowspan/colspan, will use HTML export path instead');
+            return $markdown;
+        }
+
         $markdown = $this->convertHtmlTablesToMarkdown($markdown);
 
         if (strpos($markdown, '<table') !== false) {
@@ -254,6 +280,26 @@ class PageController extends Controller
         $markdown = $this->convertCheckboxesInMarkdown($markdown);
 
         return "# " . $page->name . "\n\n" . $markdown;
+    }
+
+    /**
+     * Check if HTML tables contain rowspan or colspan attributes.
+     * Such tables cannot be properly converted to Markdown format.
+     */
+    private function hasComplexHtmlTables(string $markdown): bool
+    {
+        if (strpos($markdown, '<table') === false) {
+            return false;
+        }
+
+        if (preg_match('/<table[^>]*>[\s\S]*?<\/table>/i', $markdown, $matches)) {
+            $tableContent = $matches[0];
+            if (stripos($tableContent, 'rowspan') !== false || stripos($tableContent, 'colspan') !== false) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -328,117 +374,33 @@ class PageController extends Controller
             }
 
             $table = $tables->item(0);
-            
-            // 查找所有行（包括thead和tbody中的行）
+
             $allRows = [];
-            $thead = $table->getElementsByTagName('thead')->item(0);
-            $tbody = $table->getElementsByTagName('tbody')->item(0);
-            
-            if ($thead) {
-                foreach ($thead->getElementsByTagName('tr') as $tr) {
-                    $allRows[] = $tr;
-                }
-            }
-            if ($tbody) {
-                foreach ($tbody->getElementsByTagName('tr') as $tr) {
-                    $allRows[] = $tr;
-                }
-            }
-            
-            // 如果没有找到thead/tbody，直接查找tr
-            if (empty($allRows)) {
-                foreach ($table->getElementsByTagName('tr') as $tr) {
-                    $allRows[] = $tr;
-                }
+            foreach ($table->getElementsByTagName('tr') as $tr) {
+                $allRows[] = $tr;
             }
 
             if (empty($allRows)) {
                 return $htmlTable;
             }
 
-            // 计算最大列数
             $maxCols = 0;
             foreach ($allRows as $row) {
-                $cols = 0;
-                $cells = $row->getElementsByTagName('th');
-                if ($cells->length === 0) {
-                    $cells = $row->getElementsByTagName('td');
-                }
-                foreach ($cells as $cell) {
-                    $colspan = intval($cell->getAttribute('colspan')) ?: 1;
-                    $cols += $colspan;
-                }
+                $cols = $this->countRowSpannedColumns($row);
                 $maxCols = max($maxCols, $cols);
             }
 
-            // 处理 rowspan - 跟踪需要在下一行填充的单元格
-            $pendingRowspans = [];
             $markdownRows = [];
-            $headerProcessed = false;
 
             foreach ($allRows as $rowIndex => $row) {
-                $cells = $row->getElementsByTagName('th');
-                if ($cells->length === 0) {
-                    $cells = $row->getElementsByTagName('td');
-                }
-
-                // 将 DOMNodeList 转为数组以便索引访问
-                $cellsArray = [];
-                foreach ($cells as $cell) {
-                    $cellsArray[] = $cell;
-                }
-
-                $cellContents = [];
-                $cellIndex = 0;
-                $col = 0;
-
-                // 逐列构建行内容，正确处理 rowspan 占位列
-                while ($col < $maxCols) {
-                    // 检查当前列是否被上一行的 rowspan 占据
-                    if (isset($pendingRowspans[$col]) && $pendingRowspans[$col] > 0) {
-                        $cellContents[] = '';
-                        $pendingRowspans[$col]--;
-                        $col++;
-                        continue;
-                    }
-
-                    // 处理当前行的实际单元格
-                    if ($cellIndex < count($cellsArray)) {
-                        $cell = $cellsArray[$cellIndex];
-                        $cellText = trim($this->getElementTextWithBreaks($cell));
-                        $cellText = str_replace(['|', '\n', '\r'], ['\\|', ' ', ' '], $cellText);
-                        $cellContents[] = $cellText;
-
-                        $colspan = intval($cell->getAttribute('colspan')) ?: 1;
-                        $rowspan = intval($cell->getAttribute('rowspan')) ?: 1;
-
-                        // 处理 colspan - 为额外列添加空单元格
-                        for ($i = 1; $i < $colspan; $i++) {
-                            $col++;
-                            $cellContents[] = '';
-                        }
-
-                        // 处理 rowspan - 记录到 pendingRowspans 供后续行使用
-                        if ($rowspan > 1) {
-                            $pendingRowspans[$col] = $rowspan - 1;
-                        }
-
-                        $cellIndex++;
-                        $col++;
-                    } else {
-                        // 当前行没有更多单元格，剩余列填充空值
-                        $cellContents[] = '';
-                        $col++;
-                    }
-                }
+                $cellContents = array_fill(0, $maxCols, '');
+                $this->populateRowCells($row, $cellContents, $rowIndex);
 
                 $markdownRows[] = '| ' . implode(' | ', $cellContents) . ' |';
 
-                // 添加表头分隔行
-                if (!$headerProcessed && $row->getElementsByTagName('th')->length > 0) {
+                if ($rowIndex === 0) {
                     $separatorCells = array_fill(0, $maxCols, '---');
                     $markdownRows[] = '| ' . implode(' | ', $separatorCells) . ' |';
-                    $headerProcessed = true;
                 }
             }
 
@@ -449,13 +411,70 @@ class PageController extends Controller
         }
     }
 
+    private function countRowSpannedColumns(\DOMElement $row): int
+    {
+        $cells = $row->getElementsByTagName('th');
+        if ($cells->length === 0) {
+            $cells = $row->getElementsByTagName('td');
+        }
+
+        $totalCols = 0;
+        foreach ($cells as $cell) {
+            $colspan = intval($cell->getAttribute('colspan')) ?: 1;
+            $totalCols += $colspan;
+        }
+
+        return $totalCols;
+    }
+
+    private function populateRowCells(\DOMElement $row, array &$cellContents, int $rowIndex): void
+    {
+        $cells = $row->getElementsByTagName('th');
+        if ($cells->length === 0) {
+            $cells = $row->getElementsByTagName('td');
+        }
+
+        $cellArray = [];
+        foreach ($cells as $cell) {
+            $cellArray[] = $cell;
+        }
+
+        $col = 0;
+        $cellIndex = 0;
+
+        while ($cellIndex < count($cellArray) && $col < count($cellContents)) {
+            while ($col < count($cellContents) && trim($cellContents[$col]) !== '') {
+                $col++;
+            }
+
+            if ($col >= count($cellContents)) {
+                break;
+            }
+
+            $cell = $cellArray[$cellIndex];
+            $cellText = trim($this->getElementTextWithBreaks($cell));
+            $cellText = str_replace(['|', "\n", "\r"], ['\\|', ' ', ' '], $cellText);
+
+            $colspan = intval($cell->getAttribute('colspan')) ?: 1;
+            $colspan = min($colspan, count($cellContents) - $col);
+
+            for ($i = 0; $i < $colspan; $i++) {
+                $cellContents[$col + $i] = ($i === 0) ? $cellText : '';
+            }
+
+            $cellIndex++;
+            $col += $colspan;
+        }
+    }
+
     /**
      * Get text content from a DOM element, including nested elements.
-     * Converts <br> tags to spaces.
+     * Converts <br> tags to spaces and adds proper separators between block elements.
      */
     private function getElementTextWithBreaks(\DOMElement $element): string
     {
         $text = '';
+        $blockTags = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'tr', 'blockquote', 'pre'];
         foreach ($element->childNodes as $child) {
             if ($child instanceof \DOMText) {
                 $text .= $child->nodeValue;
@@ -463,11 +482,19 @@ class PageController extends Controller
                 if (strtolower($child->tagName) === 'br') {
                     $text .= ' ';
                 } else {
-                    $text .= $this->getElementTextWithBreaks($child);
+                    $innerText = $this->getElementTextWithBreaks($child);
+                    if (in_array(strtolower($child->tagName), $blockTags)) {
+                        $text .= "\n" . $innerText . "\n";
+                    } else {
+                        $text .= $innerText;
+                    }
                 }
             }
         }
-        return $text;
+        $text = preg_replace('/\s+/', ' ', $text);
+        $text = preg_replace('/\n\s+/', "\n", $text);
+        $text = preg_replace('/\s+\n/', "\n", $text);
+        return trim($text);
     }
 
     /**
@@ -505,11 +532,259 @@ class PageController extends Controller
 
         $markdown = $this->preserveTreeStructures($markdown);
 
+        $markdown = $this->preserveCustomTocStructures($markdown);
+
         $markdown = $this->fixMarkdownStructure($markdown);
 
         $markdown = $this->preserveCodeBlocks($markdown);
 
         return $markdown;
+    }
+
+    /**
+     * Preserve custom table of contents (TOC) structures with dot leaders.
+     * Handles TOC formats like:
+     *   1. [标题](#锚点) ........................................................................................................ 4
+     *     - 1.1. [子标题](#子锚点) .................................................................................................... 4
+     * Wraps TOC in HTML <pre> tag to preserve formatting in Word output.
+     */
+    private function preserveCustomTocStructures(string $markdown): string
+    {
+        $lines = explode("\n", $markdown);
+        $result = [];
+        $inTocBlock = false;
+        $tocStartPattern = false;
+        $consecutiveEmptyLines = 0;
+        $tocLines = [];
+
+        foreach ($lines as $line) {
+            $trimmed = trim($line);
+
+            if (!$inTocBlock && preg_match('/^#{1,6}\s+(?:目录|table\s*of\s*contents|toc|outline|目录表)/i', $trimmed)) {
+                $inTocBlock = true;
+                $tocStartPattern = true;
+                $tocLines = [];
+                $tocLines[] = $line;
+                continue;
+            }
+
+            if ($inTocBlock) {
+                if (empty($trimmed)) {
+                    $consecutiveEmptyLines++;
+                    $tocLines[] = '';
+                } else {
+                    $consecutiveEmptyLines = 0;
+                }
+
+                if ($consecutiveEmptyLines >= 2) {
+                    $inTocBlock = false;
+                    $result[] = $this->wrapTocInPreTag($tocLines);
+                    $result[] = $line;
+                    continue;
+                }
+
+                $isTocLine = $this->isTocListItem($trimmed);
+
+                if (!$isTocLine && !empty($trimmed) && !$this->isHeadingLine($trimmed) && $trimmed !== '---') {
+                    $inTocBlock = false;
+                    $result[] = $this->wrapTocInPreTag($tocLines);
+                    $result[] = $line;
+                    continue;
+                }
+
+                if ($isTocLine) {
+                    $processedLine = $this->processTocListItem($line);
+                    $tocLines[] = $processedLine;
+                    continue;
+                } elseif ($inTocBlock) {
+                    $tocLines[] = $line;
+                    continue;
+                }
+            }
+
+            $result[] = $line;
+        }
+
+        if (!empty($tocLines)) {
+            $result[] = $this->wrapTocInPreTag($tocLines);
+        }
+
+        return implode("\n", $result);
+    }
+
+    /**
+     * Wrap TOC lines in HTML <pre> tag to preserve line structure in Word output.
+     */
+    private function wrapTocInPreTag(array $tocLines): string
+    {
+        $tocContent = implode("\n", $tocLines);
+        return "<pre style=\"font-family: SimSun, serif; white-space: pre-wrap;\">" . htmlspecialchars($tocContent, ENT_QUOTES) . "</pre>";
+    }
+
+    /**
+     * Check if a line is a TOC list item with dot leader pattern.
+     */
+    private function isTocListItem(string $line): bool
+    {
+        $trimmed = trim($line);
+
+        if (empty($trimmed)) {
+            return false;
+        }
+
+        if (preg_match('/^#\s+/', $trimmed)) {
+            return false;
+        }
+
+        if (preg_match('/^(\d+\.)\s+.*\.{3,}\s*\d+\s*$/', $trimmed)) {
+            return true;
+        }
+
+        if (preg_match('/^([\*\-\+])\s*(\d+\.\d+(?:\.\d+)*)\s+.*\.{3,}\s*\d+\s*$/', $trimmed)) {
+            return true;
+        }
+
+        if (preg_match('/^([\*\-\+])\s+.*\.{3,}\s*\d+\s*$/', $trimmed)) {
+            return true;
+        }
+
+        if (preg_match('/\.{3,}\s*\d+\s*$/', $trimmed)) {
+            return true;
+        }
+
+        if (preg_match('/^(\d+\.)\s+\S/', $trimmed)) {
+            return true;
+        }
+
+        if (preg_match('/^([\*\-\+])\s*(\d+\.\d+(?:\.\d+)*)\s+\S/', $trimmed)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Check if a line is a markdown heading.
+     */
+    private function isHeadingLine(string $line): bool
+    {
+        return preg_match('/^#{1,6}\s+.*$/', trim($line)) === 1;
+    }
+
+    /**
+     * Process a TOC list item line, normalizing dot leaders.
+     * Converts patterns like "1. [标题](#anchor) ..... 4" to proper list format.
+     * Preserves indentation and dot leaders for nested list items.
+     */
+    private function processTocListItem(string $line): string
+    {
+        $leadingSpaces = strlen($line) - strlen(ltrim($line));
+        $leadingIndent = substr($line, 0, $leadingSpaces);
+        $trimmed = trim($line);
+
+        if (preg_match('/^(\d+\.)\s*([^\s].*?)(\s*)(\.{3,})(\s*)(\d+)\s*$/', $trimmed, $matches)) {
+            $listMarker = $matches[1];
+            $content = trim($matches[2]);
+            $dotLeaders = $matches[4];
+            $pageNumber = $matches[6];
+
+            $content = $this->cleanTocContent($content);
+
+            return $leadingIndent . $listMarker . ' ' . $content . $dotLeaders . ' ' . $pageNumber;
+        }
+
+        if (preg_match('/^([\-\*\+])(\s*)(\d+\.\d+(?:\.\d+)*)\s*([^\s].*?)(\s*)(\.{3,})(\s*)(\d+)\s*$/', $trimmed, $matches)) {
+            $listMarker = $matches[1];
+            $subNumber = $matches[3];
+            $content = trim($matches[4]);
+            $dotLeaders = $matches[6];
+            $pageNumber = $matches[8];
+
+            $content = $this->cleanTocContent($content);
+
+            return $leadingIndent . $listMarker . ' ' . $subNumber . '. ' . $content . $dotLeaders . ' ' . $pageNumber;
+        }
+
+        if (preg_match('/^([\-\*\+])(\s*)([^\s].*?)(\s*)(\.{3,})(\s*)(\d+)\s*$/', $trimmed, $matches)) {
+            $listMarker = $matches[1];
+            $content = trim($matches[3]);
+            $dotLeaders = $matches[5];
+            $pageNumber = $matches[7];
+
+            $content = $this->cleanTocContent($content);
+
+            return $leadingIndent . $listMarker . ' ' . $content . $dotLeaders . ' ' . $pageNumber;
+        }
+
+        $line = preg_replace('/\.{3,}/', str_repeat('.', 20), $line);
+
+        $line = preg_replace('/(\s+)-\s*(\d+\.)/', '$1- $2', $line);
+
+        $line = $this->cleanTocContent($line);
+
+        return $line;
+    }
+
+    /**
+     * Clean TOC content by removing markdown links and normalizing characters.
+     */
+    private function cleanTocContent(string $content): string
+    {
+        $content = preg_replace('/\[([^\]]+)\]\([^)]+\)/', '$1', $content);
+
+        $content = str_replace('–', '-', $content);
+        $content = str_replace('—', '-', $content);
+
+        $content = trim($content);
+
+        return $content;
+    }
+
+    /**
+     * Process table of contents in HTML to prevent line breaks in Word output.
+     * Wraps TOC items in a <pre> tag to preserve single line formatting.
+     */
+    private function processTableOfContentsInHtml(string $html): string
+    {
+        $pattern = '/(<h[1-6][^>]*>目录<\/h[1-6]>)(.*?)(?=<h[1-6]|\z)/si';
+
+        return preg_replace_callback($pattern, function ($matches) {
+            $heading = $matches[1];
+            $tocContent = $matches[2];
+
+            $lines = explode("\n", $tocContent);
+            $processedLines = [];
+
+            foreach ($lines as $line) {
+                $trimmed = trim($line);
+                if (empty($trimmed)) {
+                    $processedLines[] = '';
+                    continue;
+                }
+
+                if (preg_match('/^(\d+\.\s+.*?)\.{3,}\s*\d+\s*$/', $trimmed, $m)) {
+                    $content = preg_replace('/\.{3,}\s*\d+\s*$/', '', $trimmed);
+                    $content = trim($content);
+                    $processedLines[] = $content;
+                } elseif (preg_match('/^[\*\-\+]\s*(\d+\.\d+(?:\.\d+)*)\.\s+.*?\.{3,}\s*\d+\s*$/', $trimmed, $m)) {
+                    $content = preg_replace('/\.{3,}\s*\d+\s*$/', '', $trimmed);
+                    $content = trim($content);
+                    $content = str_replace(['–', '—'], '-', $content);
+                    $processedLines[] = $content;
+                } elseif (preg_match('/\.{3,}\s*\d+\s*$/', $trimmed)) {
+                    $content = preg_replace('/\.{3,}\s*\d+\s*$/', '', $trimmed);
+                    $content = trim($content);
+                    $content = str_replace(['–', '—'], '-', $content);
+                    $processedLines[] = $content;
+                } else {
+                    $processedLines[] = $line;
+                }
+            }
+
+            $processedToc = implode("\n", $processedLines);
+
+            return $heading . "\n<pre style=\"font-family: SimSun, serif; white-space: pre-wrap;\">" . htmlspecialchars($processedToc, ENT_QUOTES) . "</pre>";
+        }, $html);
     }
 
     /**
@@ -647,14 +922,29 @@ class PageController extends Controller
     {
         $lines = explode("\n", $markdown);
         $fixedLines = [];
+        $inPreBlock = false;
 
         foreach ($lines as $line) {
             $trimmed = trim($line);
 
+            if (strpos($line, '<pre') !== false) {
+                $inPreBlock = true;
+            }
+
+            if ($inPreBlock) {
+                $fixedLines[] = $line;
+                if (strpos($line, '</pre>') !== false) {
+                    $inPreBlock = false;
+                }
+                continue;
+            }
+
             if (preg_match('/^#{1,6}\s+.*$/', $trimmed)) {
                 $fixedLines[] = $trimmed;
             } elseif (preg_match('/^[\*\-\+]\s+.*$/', $trimmed) || preg_match('/^\d+\.\s+.*$/', $trimmed)) {
-                $fixedLines[] = $trimmed;
+                $leadingSpaces = strlen($line) - strlen(ltrim($line));
+                $leadingIndent = substr($line, 0, $leadingSpaces);
+                $fixedLines[] = $leadingIndent . $trimmed;
             } elseif (preg_match('/^```/', $trimmed)) {
                 $fixedLines[] = $trimmed;
             } elseif ($trimmed !== '') {
@@ -673,10 +963,23 @@ class PageController extends Controller
     private function preserveCodeBlocks(string $markdown): string
     {
         $inCodeBlock = false;
+        $inPreBlock = false;
         $lines = explode("\n", $markdown);
         $result = [];
 
         foreach ($lines as $line) {
+            if (strpos($line, '<pre') !== false) {
+                $inPreBlock = true;
+            }
+
+            if ($inPreBlock) {
+                $result[] = $line;
+                if (strpos($line, '</pre>') !== false) {
+                    $inPreBlock = false;
+                }
+                continue;
+            }
+
             if (preg_match('/^```/', $line)) {
                 $inCodeBlock = !$inCodeBlock;
                 $result[] = $line;
@@ -735,6 +1038,7 @@ class PageController extends Controller
 
         $this->removeSoftBreaksFromDocx($outputDocx);
         $this->addTableBordersToDocx($outputDocx);
+        $this->preventTableBreakAcrossPages($outputDocx);
         $this->centerHeadingsInDocx($outputDocx);
         $this->applyFirstParagraphStyleToDocx($outputDocx);
 
@@ -772,6 +1076,9 @@ class PageController extends Controller
         
         // 移除第一个 h1 标签（文档名称）
         $htmlContent = $this->removeFirstH1($htmlContent);
+
+        // 处理目录结构，防止 Word 转换时换行
+        $htmlContent = $this->processTableOfContentsInHtml($htmlContent);
 
         // 为正文第一个块级元素应用样式（居中、作为标题）
         $htmlContent = $this->styleFirstElementAsHeading($htmlContent);
@@ -811,13 +1118,7 @@ class PageController extends Controller
 </html>
 HTML;
 
-    // ----- 🔧 调试：保存中间 HTML 文件 -----
-    // $debugPath = storage_path('logs/export_debug_' . time() . '_' . uniqid() . '.html');
-    // file_put_contents($debugPath, $htmlString);
-    // \Illuminate\Support\Facades\Log::info('Word export - intermediate HTML saved', ['path' => $debugPath]);
-    // ---------------------------------------
-
-    return $htmlString;
+        return $htmlString;
     }
 
     /**
@@ -838,6 +1139,59 @@ HTML;
             Log::warning('Failed to remove first h1 tag: ' . $e->getMessage());
         }
 
+        return $html;
+    }
+
+    /**
+     * 保存调试用的 HTML 到日志目录，方便排查问题。
+     *
+     * @param string $html HTML 内容
+     * @param string $stage 阶段名称
+     * @return void
+     */
+    private function saveDebugHtml(string $html, string $stage): void
+    {
+        $debugPath = storage_path('logs/export_debug_' . time() . '_' . $stage . '_' . uniqid() . '.html');
+        file_put_contents($debugPath, $html);
+        Log::info('Word export debug HTML saved', ['path' => $debugPath, 'stage' => $stage]);
+    }
+
+    /**
+     * 保护表格内容：将表格用占位符替换，处理完成后再还原。
+     *
+     * @param string $html 原始 HTML
+     * @return array [$modifiedHtml, $tablePlaceholders
+     */
+    private function protectTableContent(string $html): array
+    {
+        $tablePlaceholders = [];
+        $tableIndex = 0;
+
+        if (strpos($html, '<table') === false) {
+            return [$html, $tablePlaceholders];
+        }
+
+        $html = preg_replace_callback('/<table[^>]*>[\s\S]*?<\/table>/i', function ($matches) use (&$tablePlaceholders, &$tableIndex) {
+            $placeholder = "\x00TABLE_PLACEHOLDER_{$tableIndex}\x00";
+            $tablePlaceholders[$tableIndex++] = $matches[0];
+            return $placeholder;
+        }, $html);
+
+        return [$html, $tablePlaceholders];
+    }
+
+    /**
+     * 还原表格内容，将占位符替换回原表格内容。
+     *
+     * @param string $html 处理后的 HTML（含占位符）
+     * @param array $tablePlaceholders 表格占位符数组
+     * @return string 还原后的 HTML
+     */
+    private function restoreTableContent(string $html, array $tablePlaceholders): string
+    {
+        foreach ($tablePlaceholders as $index => $tableHtml) {
+            $html = str_replace("\x00TABLE_PLACEHOLDER_{$index}\x00", $tableHtml, $html);
+        }
         return $html;
     }
 
@@ -930,6 +1284,15 @@ HTML;
      */
     private function convertCheckboxesForWord(string $html): string
     {
+        $codeBlocks = [];
+        $codeBlockIndex = 0;
+
+        $html = preg_replace_callback('/<(code|pre)[^>]*>.*?<\/\\1>/is', function ($matches) use (&$codeBlocks, &$codeBlockIndex) {
+            $placeholder = "\x00CODE_BLOCK_PLACEHOLDER_{$codeBlockIndex}\x00";
+            $codeBlocks[$codeBlockIndex++] = $matches[0];
+            return $placeholder;
+        }, $html);
+
         $html = $this->convertCheckboxInputsToCharacters($html);
         $html = $this->convertWingdingsCheckboxesToCharacters($html);
 
@@ -947,6 +1310,10 @@ HTML;
 
         foreach ($checkboxMappings as $unicode => $htmlEntity) {
             $html = str_replace($unicode, $htmlEntity, $html);
+        }
+
+        foreach ($codeBlocks as $index => $codeBlock) {
+            $html = str_replace("\x00CODE_BLOCK_PLACEHOLDER_{$index}\x00", $codeBlock, $html);
         }
 
         return $html;
@@ -974,7 +1341,12 @@ HTML;
             $escapedChar = preg_quote($char, '/');
             $html = preg_replace('/<span[^>]*mso-symbol-font-family:\s*["\']Wingdings 2?["\'][^>]*>' . $escapedChar . '<\/span>/i', $entity, $html);
             $html = preg_replace('/<span[^>]*font-family:\s*["\']Wingdings 2?["\'][^>]*>' . $escapedChar . '<\/span>/i', $entity, $html);
+
+            $html = preg_replace('/<span[^>]*mso-symbol-font-family:\s*["\']Wingdings 2?["\'][^>]*><span[^>]*>' . $escapedChar . '<\/span><\/span>/i', $entity, $html);
+            $html = preg_replace('/<span[^>]*font-family:\s*["\']Wingdings 2?["\'][^>]*><span[^>]*>' . $escapedChar . '<\/span><\/span>/i', $entity, $html);
         }
+
+        $html = str_replace('£', '&#9744;', $html);
 
         return $html;
     }
@@ -1049,16 +1421,22 @@ HTML;
 
         $listItems = [];
         $listStartIndex = -1;
+        $firstParagraph = null;
 
         foreach ($paragraphs as $index => $p) {
+            if ($this->isElementInsideTable($p, $xpath)) {
+                continue;
+            }
+
             $text = trim($p->textContent);
             if (preg_match('/^([a-z])\)\s*/i', $text, $matches)) {
                 if ($listStartIndex === -1) {
                     $listStartIndex = $index;
+                    $firstParagraph = $p;
                 }
                 $content = preg_replace('/^[a-z]\)\s*/i', '', $text);
                 $listItems[] = [
-                    'index' => $index,
+                    'paragraph' => $p,
                     'content' => $content,
                     'letter' => strtolower($matches[1])
                 ];
@@ -1068,10 +1446,11 @@ HTML;
                 }
                 $listItems = [];
                 $listStartIndex = -1;
+                $firstParagraph = null;
             }
         }
 
-        if (count($listItems) < 2) {
+        if (count($listItems) < 2 || $firstParagraph === null) {
             return $html;
         }
 
@@ -1085,12 +1464,10 @@ HTML;
             $ol->appendChild($li);
         }
 
-        $firstItem = $listItems[0]['index'];
-        $p = $paragraphs->item($firstItem);
-        $p->parentNode->insertBefore($ol, $p);
+        $firstParagraph->parentNode->insertBefore($ol, $firstParagraph);
 
         foreach ($listItems as $item) {
-            $p = $paragraphs->item($item['index']);
+            $p = $item['paragraph'];
             if ($p->parentNode) {
                 $p->parentNode->removeChild($p);
             }
@@ -1106,6 +1483,20 @@ HTML;
         }
 
         return $dom->saveHTML();
+    }
+
+    /**
+     * 检查元素是否位于表格单元格内。
+     * 用于防止在表格内容上错误执行列表转换等操作。
+     *
+     * @param \DOMElement $element 要检查的元素
+     * @param \DOMXPath $xpath DOM XPath 查询对象
+     * @return bool 如果元素在表格单元格内返回 true，否则返回 false
+     */
+    private function isElementInsideTable(\DOMElement $element, \DOMXPath $xpath): bool
+    {
+        $ancestors = $xpath->query('ancestor::td|ancestor::th|ancestor::table', $element);
+        return $ancestors->length > 0;
     }
 
     /**
@@ -1140,6 +1531,10 @@ HTML;
         $modified = false;
 
         foreach ($paragraphs as $p) {
+            if ($this->isElementInsideTable($p, $xpath)) {
+                continue;
+            }
+
             $innerHtml = $dom->saveHTML($p);
 
             if (preg_match_all('/<br\s*\/?>/i', $innerHtml, $brMatches)) {
@@ -1347,6 +1742,130 @@ HTML;
         $zip->close();
 
         Log::info('Added table borders to docx', ['tables_count' => $tables->length, 'path' => $docxPath]);
+    }
+
+    /**
+     * 确保Word文档中的表格不会跨页分割导致内容隐藏。
+     * 当表格过长跨页时，强制整个表格从新页面开始展示。
+     * 方法：
+     * 1. 为表格属性添加 <w:keepLines/> 和 <w:keepNext/> 防止表格跨页分割
+     * 2. 为每个表格行添加 <w:cantSplit/> 属性防止行跨页分割
+     * 3. 只对超过5行的长表格，在其前插入 <w:pageBreakBefore/> 强制分页
+     *    小表格（5行及以下）不强制分页，可与前文共处一页
+     */
+    private function preventTableBreakAcrossPages(string $docxPath): void
+    {
+        if (!class_exists('ZipArchive')) {
+            Log::warning('ZipArchive not available, cannot prevent table breaks');
+            return;
+        }
+
+        $zip = new ZipArchive();
+        if ($zip->open($docxPath, ZipArchive::CREATE) !== true) {
+            Log::error('Failed to open docx file for preventing table breaks', ['path' => $docxPath]);
+            return;
+        }
+
+        $documentXml = $zip->getFromName('word/document.xml');
+        if ($documentXml === false) {
+            $zip->close();
+            Log::error('word/document.xml not found in docx');
+            return;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadXML($documentXml);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+
+        $tables = $xpath->query('//w:tbl');
+        if ($tables->length === 0) {
+            $zip->close();
+            return;
+        }
+
+        $wNs = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+        $modifiedCount = 0;
+        $rowCantSplitCount = 0;
+        $tableKeepLinesCount = 0;
+        $tableKeepNextCount = 0;
+        $longTableCount = 0;
+        $LONG_TABLE_ROW_THRESHOLD = 5;
+
+        foreach ($tables as $tableIndex => $table) {
+            $tblPr = $xpath->query('w:tblPr', $table)->item(0);
+            if (!$tblPr) {
+                $tblPr = $dom->createElementNS($wNs, 'w:tblPr');
+                $table->insertBefore($tblPr, $table->firstChild);
+            }
+
+            $keepLines = $xpath->query('w:keepLines', $tblPr)->item(0);
+            if (!$keepLines) {
+                $keepLines = $dom->createElementNS($wNs, 'w:keepLines');
+                $tblPr->appendChild($keepLines);
+                $tableKeepLinesCount++;
+            }
+
+            $keepNext = $xpath->query('w:keepNext', $tblPr)->item(0);
+            if (!$keepNext) {
+                $keepNext = $dom->createElementNS($wNs, 'w:keepNext');
+                $tblPr->appendChild($keepNext);
+                $tableKeepNextCount++;
+            }
+
+            $tableRows = $xpath->query('w:tr', $table);
+            $rowCount = $tableRows->length;
+            foreach ($tableRows as $row) {
+                $trPr = $xpath->query('w:trPr', $row)->item(0);
+                if (!$trPr) {
+                    $trPr = $dom->createElementNS($wNs, 'w:trPr');
+                    $row->insertBefore($trPr, $row->firstChild);
+                }
+
+                $cantSplit = $xpath->query('w:cantSplit', $trPr)->item(0);
+                if (!$cantSplit) {
+                    $cantSplit = $dom->createElementNS($wNs, 'w:cantSplit');
+                    $trPr->appendChild($cantSplit);
+                    $rowCantSplitCount++;
+                }
+            }
+
+            if ($rowCount > $LONG_TABLE_ROW_THRESHOLD) {
+                $breakParagraph = $dom->createElementNS($wNs, 'w:p');
+                $breakPPr = $dom->createElementNS($wNs, 'w:pPr');
+                $breakPageBreak = $dom->createElementNS($wNs, 'w:pageBreakBefore');
+                $breakPPr->appendChild($breakPageBreak);
+                $breakParagraph->appendChild($breakPPr);
+
+                if ($table->previousSibling) {
+                    $table->parentNode->insertBefore($breakParagraph, $table);
+                } else {
+                    $body = $xpath->query('//w:body')->item(0);
+                    if ($body) {
+                        $body->insertBefore($breakParagraph, $table);
+                    }
+                }
+                $modifiedCount++;
+                $longTableCount++;
+            }
+        }
+
+        $newXml = $dom->saveXML();
+        $zip->addFromString('word/document.xml', $newXml);
+        $zip->close();
+
+        Log::info('Prevented table breaks across pages', [
+            'tables_count' => $tables->length,
+            'pagebreaks_added' => $modifiedCount,
+            'long_tables' => $longTableCount,
+            'rows_cant_split' => $rowCantSplitCount,
+            'tbl_keep_lines' => $tableKeepLinesCount,
+            'tbl_keep_next' => $tableKeepNextCount,
+            'path' => $docxPath
+        ]);
     }
 
     /**
@@ -1616,6 +2135,9 @@ HTML;
         // ----- 6. 后处理：为所有表格添加边框 -----
         $this->addTableBordersToDocx($outputDocx);
 
+        // ----- 6.1 后处理：防止表格跨页分割 -----
+        $this->preventTableBreakAcrossPages($outputDocx);
+
         // ----- 7. 后处理：设置所有表格居中 -----
         $this->centerTablesInDocx($outputDocx);
 
@@ -1781,7 +2303,7 @@ HTML;
         $dom->loadHTML('<?xml encoding="utf-8"?>' . $html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
         libxml_clear_errors();
 
-        $blockTags = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'pre', 'blockquote', 'table', 'ul', 'ol'];
+        $blockTags = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'pre', 'blockquote', 'ul', 'ol'];
         $firstElement = null;
         $skippedEmptyCount = 0;
 
@@ -1797,7 +2319,7 @@ HTML;
                     $textContent = preg_replace('/[\x{00A0}\x{202F}\x{2000}-\x{200A}\x{200B}]/u', '', $textContent);
                     $textContent = trim($textContent);
 
-                    if ($textContent === '' && $tag !== 'table') {
+                    if ($textContent === '') {
                         $skippedEmptyCount++;
                         continue;
                     }
