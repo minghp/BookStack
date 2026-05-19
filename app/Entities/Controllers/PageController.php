@@ -178,6 +178,51 @@ class PageController extends Controller
     }
 
     /**
+     * 判断表格是否为"长表格"，需要强制分页。
+     * 不再仅依赖行数判断，因为单元格内文字可能很多行。
+     * 综合评估：
+     * - 总字符数（表格内容越多，越可能跨页）
+     * - 单元格段落数（单元格内文字换行越多，占用越高）
+     * - 简单行数（作为辅助判断）
+     */
+    private function isLongTable(\DOMElement $table, \DOMXPath $xpath): bool
+    {
+        $tableRows = $xpath->query('.//w:tr', $table);
+        $rowCount = $tableRows->length;
+
+        $totalTextLength = 0;
+        $totalCellParagraphs = 0;
+
+        foreach ($tableRows as $row) {
+            $cells = $xpath->query('.//w:tc', $row);
+            foreach ($cells as $cell) {
+                $totalTextLength += strlen(trim($cell->textContent));
+
+                $cellParagraphs = $xpath->query('.//w:p', $cell);
+                $totalCellParagraphs += $cellParagraphs->length;
+            }
+        }
+
+        $LONG_TABLE_TEXT_THRESHOLD = 500;
+        $LONG_TABLE_PARAGRAPH_THRESHOLD = 15;
+        $LONG_TABLE_ROW_THRESHOLD = 8;
+
+        if ($totalTextLength > $LONG_TABLE_TEXT_THRESHOLD) {
+            return true;
+        }
+
+        if ($totalCellParagraphs > $LONG_TABLE_PARAGRAPH_THRESHOLD) {
+            return true;
+        }
+
+        if ($rowCount > $LONG_TABLE_ROW_THRESHOLD) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
      * Export page as Word document.
      *
      * @throws NotFoundException
@@ -1750,8 +1795,12 @@ HTML;
      * 方法：
      * 1. 为表格属性添加 <w:keepLines/> 和 <w:keepNext/> 防止表格跨页分割
      * 2. 为每个表格行添加 <w:cantSplit/> 属性防止行跨页分割
-     * 3. 只对超过5行的长表格，在其前插入 <w:pageBreakBefore/> 强制分页
-     *    小表格（5行及以下）不强制分页，可与前文共处一页
+     * 3. 分页策略：
+     *    - 表格内容量超过阈值（基于字符数和单元格段落数）：强制分页
+     *    - 表格行数 > 8 且内容较少：强制分页
+     *    - 根据前面内容判断（前面有另一个表格/多段落/图片）：分页
+     *    - 其他情况（只有标题/少数段落）：不分页，让小表格与前文共处一页
+     * 说明：不再仅依赖行数判断，因为单元格内文字可能很多行
      */
     private function preventTableBreakAcrossPages(string $docxPath): void
     {
@@ -1793,7 +1842,7 @@ HTML;
         $tableKeepLinesCount = 0;
         $tableKeepNextCount = 0;
         $longTableCount = 0;
-        $LONG_TABLE_ROW_THRESHOLD = 5;
+        $LONG_TABLE_ROW_THRESHOLD = 8;
 
         foreach ($tables as $tableIndex => $table) {
             $tblPr = $xpath->query('w:tblPr', $table)->item(0);
@@ -1833,7 +1882,12 @@ HTML;
                 }
             }
 
-            if ($rowCount > $LONG_TABLE_ROW_THRESHOLD) {
+            $needsPageBreak = $this->isLongTable($table, $xpath);
+            if (!$needsPageBreak) {
+                $needsPageBreak = $this->hasSubstantialPrecedingContent($table, $xpath);
+            }
+
+            if ($needsPageBreak) {
                 $breakParagraph = $dom->createElementNS($wNs, 'w:p');
                 $breakPPr = $dom->createElementNS($wNs, 'w:pPr');
                 $breakPageBreak = $dom->createElementNS($wNs, 'w:pageBreakBefore');
@@ -1866,6 +1920,74 @@ HTML;
             'tbl_keep_next' => $tableKeepNextCount,
             'path' => $docxPath
         ]);
+    }
+
+    /**
+     * 检查表格前是否有较长的内容段落。
+     * 如果前面只有标题或少量段落，不算"较长内容"；
+     * 如果前面有多个段落、图片或另一个表格，则认为是"较长内容"。
+     * 图片会占用较多页面空间，因此有图片时会降低段落数量阈值。
+     */
+    private function hasSubstantialPrecedingContent(\DOMElement $table, \DOMXPath $xpath): bool
+    {
+        $precedingSiblings = $xpath->query('preceding-sibling::*', $table);
+
+        if ($precedingSiblings->length === 0) {
+            return false;
+        }
+
+        $paragraphCount = 0;
+        $tableCount = 0;
+        $totalTextLength = 0;
+        $hasImages = false;
+
+        foreach ($precedingSiblings as $sibling) {
+            if ($sibling instanceof \DOMElement) {
+                if (strtolower($sibling->tagName) === 'p') {
+                    $paragraphCount++;
+                    $totalTextLength += strlen(trim($sibling->textContent));
+
+                    if ($this->paragraphContainsImage($sibling, $xpath)) {
+                        $hasImages = true;
+                    }
+                } elseif (strtolower($sibling->tagName) === 'tbl') {
+                    $tableCount++;
+                }
+            }
+        }
+
+        if ($tableCount > 0) {
+            return true;
+        }
+
+        if ($hasImages && $paragraphCount >= 2) {
+            return true;
+        }
+
+        if ($paragraphCount >= 3 && $totalTextLength > 100) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * 检查段落内是否包含图片元素。
+     * Word XML 中图片通常表示为 <w:drawing> 或 <w:pict>。
+     */
+    private function paragraphContainsImage(\DOMElement $paragraph, \DOMXPath $xpath): bool
+    {
+        $drawings = $xpath->query('.//w:drawing', $paragraph);
+        if ($drawings->length > 0) {
+            return true;
+        }
+
+        $picts = $xpath->query('.//w:pict', $paragraph);
+        if ($picts->length > 0) {
+            return true;
+        }
+
+        return false;
     }
 
     /**
