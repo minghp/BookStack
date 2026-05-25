@@ -3070,8 +3070,10 @@ HTML;
 
 
     /**
-     * 为所有带 text-indent 的块级元素插入全角空格占位符，模拟首行缩进。
-     * 同时移除原有的 text-indent 样式，避免 Pandoc 干扰。
+     * 为所有段落(p标签)添加首行缩进两个字符。
+     * - 如果段落已有 text-indent 样式，插入全角空格占位符并移除原样式
+     * - 如果段落没有首行缩进，插入两个全角空格实现缩进
+     * - 标题标签(h1-h6)不进行缩进处理
      *
      * @param string $html HTML 片段
      * @return string 处理后的 HTML
@@ -3088,65 +3090,65 @@ HTML;
         libxml_clear_errors();
 
         $xpath = new \DOMXPath($dom);
-        // 只处理块级元素（可根据需要增删）
-        $blockTags = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li'];
-        $nodes = $xpath->query('//*[@style]');
+        $headingTags = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'];
+        $paragraphTags = ['p'];
 
+        $paragraphs = $xpath->query('//p');
         $modifiedCount = 0;
-        foreach ($nodes as $node) {
-            // 只处理块级标签
-            if (!in_array($node->tagName, $blockTags)) {
-                continue;
-            }
 
+        foreach ($paragraphs as $node) {
             $style = $node->getAttribute('style');
-            if (!preg_match('/text-indent:\s*([^;]+);/', $style, $matches)) {
-                continue;
-            }
+            $hasTextIndent = preg_match('/text-indent:\s*([^;]+);/', $style, $matches);
 
-            $indentValue = trim($matches[1]);
-            // 提取数值，忽略单位
-            preg_match('/([\d.]+)/', $indentValue, $numMatches);
-            $indentNum = floatval($numMatches[0] ?? 0);
+            if ($hasTextIndent) {
+                $indentValue = trim($matches[1]);
+                preg_match('/([\d.]+)/', $indentValue, $numMatches);
+                $indentNum = floatval($numMatches[0] ?? 0);
 
-            // 缩进阈值：> 5pt 或 > 0.5em 认为需要缩进
-            $shouldIndent = false;
-            if (strpos($indentValue, 'pt') !== false && $indentNum > 5) {
-                $shouldIndent = true;
-            }
-            if (strpos($indentValue, 'em') !== false && $indentNum > 0.5) {
-                $shouldIndent = true;
-            }
-            // 其他单位可酌情添加
+                $shouldIndent = false;
+                if (strpos($indentValue, 'pt') !== false && $indentNum > 5) {
+                    $shouldIndent = true;
+                }
+                if (strpos($indentValue, 'em') !== false && $indentNum > 0.5) {
+                    $shouldIndent = true;
+                }
 
-            if (!$shouldIndent) {
-                continue;
-            }
+                if ($shouldIndent) {
+                    $fullwidthSpace = '　';
+                    $spaceNode = $dom->createTextNode($fullwidthSpace . $fullwidthSpace);
 
-            // ----- 在元素内容最前面插入两个全角空格 -----
-            $fullwidthSpace = '　'; // UTF-8 全角空格，直接按字面量
-            $spaceNode = $dom->createTextNode($fullwidthSpace . $fullwidthSpace);
-            
-            // 如果元素有子节点，插入到第一个子节点之前
-            if ($node->hasChildNodes()) {
-                $node->insertBefore($spaceNode, $node->firstChild);
+                    if ($node->hasChildNodes()) {
+                        $node->insertBefore($spaceNode, $node->firstChild);
+                    } else {
+                        $node->appendChild($spaceNode);
+                    }
+
+                    $style = preg_replace('/text-indent:\s*[^;]+;?/', '', $style);
+                    if (trim($style) === '') {
+                        $node->removeAttribute('style');
+                    } else {
+                        $node->setAttribute('style', $style);
+                    }
+
+                    $modifiedCount++;
+                }
             } else {
-                // 空元素，直接追加文本节点
-                $node->appendChild($spaceNode);
-            }
+                $textContent = trim($node->textContent);
+                if (!empty($textContent)) {
+                    $fullwidthSpace = '　';
+                    $spaceNode = $dom->createTextNode($fullwidthSpace . $fullwidthSpace);
 
-            // ----- 移除原有的 text-indent 样式，避免干扰 -----
-            $style = preg_replace('/text-indent:\s*[^;]+;?/', '', $style);
-            if (trim($style) === '') {
-                $node->removeAttribute('style');
-            } else {
-                $node->setAttribute('style', $style);
-            }
+                    if ($node->hasChildNodes()) {
+                        $node->insertBefore($spaceNode, $node->firstChild);
+                    } else {
+                        $node->appendChild($spaceNode);
+                    }
 
-            $modifiedCount++;
+                    $modifiedCount++;
+                }
+            }
         }
 
-        // ----- 重新拼接 HTML 片段 -----
         $innerHtml = '';
         foreach ($dom->childNodes as $child) {
             if ($child instanceof \DOMProcessingInstruction) {
@@ -3155,11 +3157,9 @@ HTML;
             $innerHtml .= $dom->saveHTML($child);
         }
 
-        // 调试日志（可保留或删除）
-        // \Illuminate\Support\Facades\Log::info('insertIndentPlaceholders() - processed', [
-        //     'modified_count' => $modifiedCount,
-        //     'html_length' => strlen($innerHtml)
-        // ]);
+        Log::info('insertIndentPlaceholders: processed paragraphs', [
+            'modified_count' => $modifiedCount
+        ]);
 
         return $innerHtml;
     }
