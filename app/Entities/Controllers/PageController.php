@@ -1086,6 +1086,8 @@ class PageController extends Controller
         $this->preventTableBreakAcrossPages($outputDocx);
         $this->centerHeadingsInDocx($outputDocx);
         $this->applyFirstParagraphStyleToDocx($outputDocx);
+        $this->centerTablesInDocx($outputDocx);
+        $this->setWideTablesToLandscape($outputDocx);
 
         if (!file_exists($outputDocx) || filesize($outputDocx) === 0) {
             throw new \Exception('Generated Word document is empty or does not exist');
@@ -2053,6 +2055,432 @@ HTML;
     }
 
     /**
+     * 将列数超过10列的表格设置为横向（landscape）布局。
+     * 原理：OOXML中sectPr定义的是该元素之前内容的section属性。
+     * 因此在表格前插入竖置sectPr确保前面的段落保持竖置，
+     * 在表格后插入横置sectPr使表格以横向展示，
+     * 最后再插入竖置sectPr使后续内容恢复竖置。
+     * A4纸横向尺寸：宽度29.7cm (16838 twips)，高度21cm (11906 twips)
+     */
+    private function setWideTablesToLandscape(string $docxPath): void
+    {
+        if (!class_exists('ZipArchive')) {
+            Log::warning('ZipArchive not available, cannot set wide tables to landscape');
+            return;
+        }
+
+        $zip = new ZipArchive();
+        if ($zip->open($docxPath, ZipArchive::CREATE) !== true) {
+            Log::error('Failed to open docx file for setting wide tables to landscape', ['path' => $docxPath]);
+            return;
+        }
+
+        $documentXml = $zip->getFromName('word/document.xml');
+        if ($documentXml === false) {
+            $zip->close();
+            Log::error('word/document.xml not found in docx');
+            return;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadXML($documentXml);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+
+        $tables = $xpath->query('//w:tbl');
+        if ($tables->length === 0) {
+            $zip->close();
+            return;
+        }
+
+        $wNs = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+        $wideTableCount = 0;
+        $COLUMN_THRESHOLD = 10;
+
+        $tablesToProcess = [];
+
+        foreach ($tables as $index => $table) {
+            $columnCount = $this->getTableColumnCount($table, $xpath);
+            if ($columnCount > $COLUMN_THRESHOLD) {
+                $tablesToProcess[] = [
+                    'table' => $table,
+                    'columns' => $columnCount,
+                    'index' => $index
+                ];
+            }
+        }
+
+        if (empty($tablesToProcess)) {
+            $zip->close();
+            return;
+        }
+
+        foreach ($tablesToProcess as $tableInfo) {
+            $table = $tableInfo['table'];
+            $columnCount = $tableInfo['columns'];
+            $wideTableCount++;
+
+            $pLandscape = $dom->createElementNS($wNs, 'w:p');
+            $pPrLandscape = $dom->createElementNS($wNs, 'w:pPr');
+            $sectPrLandscape = $dom->createElementNS($wNs, 'w:sectPr');
+            $sectPrLandscape->setAttribute('w:type', 'continuous');
+
+            $pgSzLandscape = $dom->createElementNS($wNs, 'w:pgSz');
+            $pgSzLandscape->setAttribute('w:w', '16838');
+            $pgSzLandscape->setAttribute('w:h', '11906');
+            $pgSzLandscape->setAttribute('w:orient', 'landscape');
+            $sectPrLandscape->appendChild($pgSzLandscape);
+
+            $pgMarLandscape = $dom->createElementNS($wNs, 'w:pgMar');
+            $pgMarLandscape->setAttribute('w:top', '1440');
+            $pgMarLandscape->setAttribute('w:right', '1440');
+            $pgMarLandscape->setAttribute('w:bottom', '1440');
+            $pgMarLandscape->setAttribute('w:left', '1440');
+            $pgMarLandscape->setAttribute('w:header', '708');
+            $pgMarLandscape->setAttribute('w:footer', '708');
+            $pgMarLandscape->setAttribute('w:gutter', '0');
+            $sectPrLandscape->appendChild($pgMarLandscape);
+
+            $colsLandscape = $dom->createElementNS($wNs, 'w:cols');
+            $colsLandscape->setAttribute('w:space', '720');
+            $sectPrLandscape->appendChild($colsLandscape);
+
+            $pPrLandscape->appendChild($sectPrLandscape);
+            $pLandscape->appendChild($pPrLandscape);
+            $rLandscape = $dom->createElementNS($wNs, 'w:r');
+            $tLandscape = $dom->createElementNS($wNs, 'w:t');
+            $tLandscape->appendChild($dom->createTextNode(' '));
+            $rLandscape->appendChild($tLandscape);
+            $pLandscape->appendChild($rLandscape);
+
+            $parent = $table->parentNode;
+
+            $prevParagraph = $this->findPreviousParagraph($table);
+            if ($prevParagraph) {
+                $this->addPortraitSectPrToParagraph($prevParagraph, $dom, $wNs);
+            } else {
+                $pPortraitBefore = $this->buildPortraitSectPrParagraph($dom, $wNs);
+                $parent->insertBefore($pPortraitBefore, $table);
+            }
+
+            $nextSibling = $table->nextSibling;
+            $parent->insertBefore($pLandscape, $nextSibling);
+
+            $this->adjustTableWidthForLandscape($table, $xpath);
+
+            Log::info('Set wide table to landscape', [
+                'columns' => $columnCount,
+                'threshold' => $COLUMN_THRESHOLD
+            ]);
+        }
+
+        $newXml = $dom->saveXML();
+        $zip->addFromString('word/document.xml', $newXml);
+        $zip->close();
+
+        Log::info('Set wide tables to landscape in docx', [
+            'wide_tables_count' => $wideTableCount,
+            'path' => $docxPath
+        ]);
+    }
+
+    /**
+     * 找到表格之前的最后一个 w:p 段落节点。
+     */
+    private function findPreviousParagraph(\DOMElement $table): ?\DOMElement
+    {
+        $prev = $table->previousSibling;
+        while ($prev) {
+            if ($prev->nodeType === XML_ELEMENT_NODE && $prev->nodeName === 'w:p') {
+                $prevPPr = $prev->getElementsByTagNameNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'pPr');
+                if ($prevPPr->length > 0) {
+                    $sectPrs = $prevPPr->item(0)->getElementsByTagNameNS('http://schemas.openxmlformats.org/wordprocessingml/2006/main', 'sectPr');
+                    if ($sectPrs->length === 0) {
+                        return $prev;
+                    }
+                } else {
+                    return $prev;
+                }
+            }
+            $prev = $prev->previousSibling;
+        }
+        return null;
+    }
+
+    /**
+     * 向已有段落添加竖置 sectPr。
+     */
+    private function addPortraitSectPrToParagraph(\DOMElement $paragraph, \DOMDocument $dom, string $wNs): void
+    {
+        $pPr = $paragraph->getElementsByTagNameNS($wNs, 'pPr')->item(0);
+        if (!$pPr) {
+            $pPr = $dom->createElementNS($wNs, 'w:pPr');
+            $paragraph->insertBefore($pPr, $paragraph->firstChild);
+        }
+
+        $sectPr = $dom->createElementNS($wNs, 'w:sectPr');
+        $sectPr->setAttribute('w:type', 'continuous');
+
+        $pgSz = $dom->createElementNS($wNs, 'w:pgSz');
+        $pgSz->setAttribute('w:w', '11906');
+        $pgSz->setAttribute('w:h', '16838');
+        $pgSz->setAttribute('w:orient', 'portrait');
+        $sectPr->appendChild($pgSz);
+
+        $pgMar = $dom->createElementNS($wNs, 'w:pgMar');
+        $pgMar->setAttribute('w:top', '1440');
+        $pgMar->setAttribute('w:right', '1440');
+        $pgMar->setAttribute('w:bottom', '1440');
+        $pgMar->setAttribute('w:left', '1440');
+        $pgMar->setAttribute('w:header', '708');
+        $pgMar->setAttribute('w:footer', '708');
+        $pgMar->setAttribute('w:gutter', '0');
+        $sectPr->appendChild($pgMar);
+
+        $cols = $dom->createElementNS($wNs, 'w:cols');
+        $cols->setAttribute('w:space', '720');
+        $sectPr->appendChild($cols);
+
+        $pPr->appendChild($sectPr);
+    }
+
+    /**
+     * 构建一个包含竖置 sectPr 的最小段落。
+     */
+    private function buildPortraitSectPrParagraph(\DOMDocument $dom, string $wNs): \DOMElement
+    {
+        $p = $dom->createElementNS($wNs, 'w:p');
+        $pPr = $dom->createElementNS($wNs, 'w:pPr');
+        $sectPr = $dom->createElementNS($wNs, 'w:sectPr');
+        $sectPr->setAttribute('w:type', 'continuous');
+
+        $pgSz = $dom->createElementNS($wNs, 'w:pgSz');
+        $pgSz->setAttribute('w:w', '11906');
+        $pgSz->setAttribute('w:h', '16838');
+        $pgSz->setAttribute('w:orient', 'portrait');
+        $sectPr->appendChild($pgSz);
+
+        $pgMar = $dom->createElementNS($wNs, 'w:pgMar');
+        $pgMar->setAttribute('w:top', '1440');
+        $pgMar->setAttribute('w:right', '1440');
+        $pgMar->setAttribute('w:bottom', '1440');
+        $pgMar->setAttribute('w:left', '1440');
+        $pgMar->setAttribute('w:header', '708');
+        $pgMar->setAttribute('w:footer', '708');
+        $pgMar->setAttribute('w:gutter', '0');
+        $sectPr->appendChild($pgMar);
+
+        $cols = $dom->createElementNS($wNs, 'w:cols');
+        $cols->setAttribute('w:space', '720');
+        $sectPr->appendChild($cols);
+
+        $pPr->appendChild($sectPr);
+        $p->appendChild($pPr);
+        $r = $dom->createElementNS($wNs, 'w:r');
+        $t = $dom->createElementNS($wNs, 'w:t');
+        $t->appendChild($dom->createTextNode(' '));
+        $r->appendChild($t);
+        $p->appendChild($r);
+
+        return $p;
+    }
+
+    /**
+     * 获取表格的列数（通过检查第一行的最大列数）
+     */
+    private function getTableColumnCount(\DOMElement $table, \DOMXPath $xpath): int
+    {
+        $rows = $xpath->query('w:tr', $table);
+        if ($rows->length === 0) {
+            return 0;
+        }
+
+        $maxCols = 0;
+        foreach ($rows as $row) {
+            $colCount = 0;
+            $cells = $xpath->query('w:tc', $row);
+            foreach ($cells as $cell) {
+                $colspan = $xpath->query('w:tcPr/w:gridSpan', $cell)->item(0);
+                if ($colspan) {
+                    $colCount += intval($colspan->getAttribute('w:val')) ?: 1;
+                } else {
+                    $colCount += 1;
+                }
+            }
+            $maxCols = max($maxCols, $colCount);
+            if ($maxCols > 10) {
+                break;
+            }
+        }
+
+        return $maxCols;
+    }
+
+    /**
+     * 调整横置表格的宽度，使其适配A4横向页面。
+     * A4横向页面可用宽度约为13958 twips (29.7cm - 左右边距各2.54cm)
+     * 根据每列的内容长度按比例分配列宽，中文字符按2倍宽度计算。
+     */
+    private function adjustTableWidthForLandscape(\DOMElement $table, \DOMXPath $xpath): void
+    {
+        $wNs = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+        $columnCount = $this->getTableColumnCount($table, $xpath);
+
+        $usablePageWidth = 13958;
+        $minCellWidth = 400;
+        $maxCellWidth = 6000;
+
+        $colContentWidths = $this->calculateColumnContentWidths($table, $xpath, $columnCount);
+
+        $totalContentWidth = array_sum($colContentWidths);
+        if ($totalContentWidth <= 0) {
+            $totalContentWidth = $columnCount;
+            $colContentWidths = array_fill(0, $columnCount, 1);
+        }
+
+        $colWidths = [];
+        foreach ($colContentWidths as $i => $cw) {
+            $proportional = intval(($cw / $totalContentWidth) * $usablePageWidth);
+            $colWidths[$i] = max($minCellWidth, min($maxCellWidth, $proportional));
+        }
+
+        $totalAssigned = array_sum($colWidths);
+        if ($totalAssigned > 0 && $totalAssigned !== $usablePageWidth) {
+            $scale = $usablePageWidth / $totalAssigned;
+            foreach ($colWidths as $i => $w) {
+                $colWidths[$i] = max($minCellWidth, intval($w * $scale));
+            }
+        }
+
+        $tblPr = $xpath->query('w:tblPr', $table)->item(0);
+        if (!$tblPr) {
+            $tblPr = $table->ownerDocument->createElementNS($wNs, 'w:tblPr');
+            $table->insertBefore($tblPr, $table->firstChild);
+        }
+
+        $tblW = $xpath->query('w:tblW', $tblPr)->item(0);
+        if (!$tblW) {
+            $tblW = $table->ownerDocument->createElementNS($wNs, 'w:tblW');
+            $tblPr->appendChild($tblW);
+        }
+        $tblW->setAttribute('w:w', strval($usablePageWidth));
+        $tblW->setAttribute('w:type', 'dxa');
+
+        $tblGrid = $xpath->query('w:tblGrid', $table)->item(0);
+        if (!$tblGrid) {
+            $tblGrid = $table->ownerDocument->createElementNS($wNs, 'w:tblGrid');
+            $table->insertBefore($tblGrid, $table->firstChild);
+        } else {
+            $existingGrids = $xpath->query('w:gridCol', $tblGrid);
+            foreach ($existingGrids as $gridCol) {
+                $tblGrid->removeChild($gridCol);
+            }
+        }
+
+        for ($i = 0; $i < $columnCount; $i++) {
+            $gridCol = $table->ownerDocument->createElementNS($wNs, 'w:gridCol');
+            $gridCol->setAttribute('w:w', strval($colWidths[$i]));
+            $tblGrid->appendChild($gridCol);
+        }
+
+        $rows = $xpath->query('w:tr', $table);
+        foreach ($rows as $row) {
+            $cells = $xpath->query('w:tc', $row);
+            $colIndex = 0;
+            foreach ($cells as $cell) {
+                $colspan = 1;
+                $tcPr = $xpath->query('w:tcPr', $cell)->item(0);
+                if ($tcPr) {
+                    $gridSpan = $xpath->query('w:gridSpan', $tcPr)->item(0);
+                    if ($gridSpan) {
+                        $colspan = intval($gridSpan->getAttribute('w:val')) ?: 1;
+                    }
+                }
+
+                $combinedWidth = 0;
+                for ($j = 0; $j < $colspan && ($colIndex + $j) < $columnCount; $j++) {
+                    $combinedWidth += $colWidths[$colIndex + $j];
+                }
+
+                $tcW = $xpath->query('w:tcW', $cell)->item(0);
+                if (!$tcW) {
+                    $tcW = $table->ownerDocument->createElementNS($wNs, 'w:tcW');
+                    $cell->insertBefore($tcW, $cell->firstChild);
+                }
+                $tcW->setAttribute('w:w', strval($combinedWidth));
+                $tcW->setAttribute('w:type', 'dxa');
+
+                $colIndex += $colspan;
+            }
+        }
+    }
+
+    /**
+     * 计算每列的内容宽度。
+     * 扫描所有行，取每列中内容最宽的单元格作为该列的内容宽度。
+     * 中文字符按2个单位宽度计算，ASCII字符按1个单位计算。
+     */
+    private function calculateColumnContentWidths(\DOMElement $table, \DOMXPath $xpath, int $columnCount): array
+    {
+        $colWidths = array_fill(0, $columnCount, 0);
+        $rows = $xpath->query('w:tr', $table);
+
+        foreach ($rows as $row) {
+            $cells = $xpath->query('w:tc', $row);
+            $colIndex = 0;
+            foreach ($cells as $cell) {
+                if ($colIndex >= $columnCount) {
+                    break;
+                }
+
+                $colspan = 1;
+                $tcPr = $xpath->query('w:tcPr', $cell)->item(0);
+                if ($tcPr) {
+                    $gridSpan = $xpath->query('w:gridSpan', $tcPr)->item(0);
+                    if ($gridSpan) {
+                        $colspan = intval($gridSpan->getAttribute('w:val')) ?: 1;
+                    }
+                }
+
+                $textContent = '';
+                $textNodes = $xpath->query('.//w:t', $cell);
+                foreach ($textNodes as $t) {
+                    $textContent .= $t->textContent;
+                }
+
+                $charWidth = 0;
+                $chars = mb_str_split($textContent ?: '');
+                foreach ($chars as $ch) {
+                    $ord = mb_ord($ch);
+                    if ($ord >= 0x4E00 && $ord <= 0x9FFF || $ord >= 0x3000 && $ord <= 0x303F || $ord >= 0xFF00 && $ord <= 0xFFEF) {
+                        $charWidth += 2;
+                    } else {
+                        $charWidth += 1;
+                    }
+                }
+
+                $charWidth = max(1, $charWidth);
+
+                if ($colspan <= 1) {
+                    $colWidths[$colIndex] = max($colWidths[$colIndex], $charWidth);
+                } else {
+                    $perColWidth = intval($charWidth / $colspan);
+                    for ($j = 0; $j < $colspan && ($colIndex + $j) < $columnCount; $j++) {
+                        $colWidths[$colIndex + $j] = max($colWidths[$colIndex + $j], $perColWidth);
+                    }
+                }
+
+                $colIndex += $colspan;
+            }
+        }
+
+        return $colWidths;
+    }
+
+    /**
      * 设置Word文档中所有标题居中对齐。
      * 不依赖pandoc的居中设置，直接为所有标题样式设置居中。
      */
@@ -2263,7 +2691,10 @@ HTML;
         // ----- 7. 后处理：设置所有表格居中 -----
         $this->centerTablesInDocx($outputDocx);
 
-        // ----- 8. 验证输出文件 -----
+        // ----- 8. 后处理：将列数超过10列的表格设置为横向布局 -----
+        $this->setWideTablesToLandscape($outputDocx);
+
+        // ----- 9. 验证输出文件 -----
         if (!file_exists($outputDocx) || filesize($outputDocx) === 0) {
             throw new \Exception('Generated Word document is empty or does not exist');
         }
