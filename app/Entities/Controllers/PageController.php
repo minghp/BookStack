@@ -323,6 +323,7 @@ class PageController extends Controller
         $markdown = $this->normalizeMarkdownContent($markdown);
         $markdown = $this->replaceNonBreakingSpacesInMarkdown($markdown);
         $markdown = $this->convertCheckboxesInMarkdown($markdown);
+        $markdown = $this->processApprovalTableInMarkdown($markdown);
 
         return "# " . $page->name . "\n\n" . $markdown;
     }
@@ -1124,6 +1125,9 @@ class PageController extends Controller
         // 移除第一个 h1 标签（文档名称）
         $htmlContent = $this->removeFirstH1($htmlContent);
 
+        // 处理审批表格（编制/审核/批准），清除填写内容并在表格后添加分页
+        $htmlContent = $this->processApprovalTable($htmlContent);
+
         // 处理目录结构，防止 Word 转换时换行
         $htmlContent = $this->processTableOfContentsInHtml($htmlContent);
 
@@ -1240,6 +1244,751 @@ HTML;
             $html = str_replace("\x00TABLE_PLACEHOLDER_{$index}\x00", $tableHtml, $html);
         }
         return $html;
+    }
+
+    /**
+     * 处理文档中的审批表格（编制/审核/批准）。
+     * 检测 HTML 中是否包含审批信息表格，如果找到则：
+     * 1. 清除填写内容（xxx 部分），保留标签（编制：、审核：、批准：、日期：）
+     * 2. 在标签后保留6个全角空格占位符
+     * 3. 在表格后添加分页符，使后续内容从新页开始
+     *
+     * @param string $html HTML 片段
+     * @return string 处理后的 HTML
+     */
+    private function processApprovalTable(string $html): string
+    {
+        if (strpos($html, '<table') === false) {
+            return $html;
+        }
+
+        if (!extension_loaded('dom')) {
+            return $html;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadHTML('<?xml encoding="utf-8"?>' . $html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        libxml_clear_errors();
+
+        $tables = $dom->getElementsByTagName('table');
+        $found = false;
+
+        foreach ($tables as $table) {
+            if ($this->isApprovalTable($table)) {
+                $this->clearApprovalTableContent($table);
+
+                $changeRecordTable = $this->findChangeRecordTable($table);
+                if ($changeRecordTable !== null) {
+                    $this->addPageBreakAfterTable($changeRecordTable, $dom);
+                    Log::info('Found change record table, added page break after it');
+                } else {
+                    $this->addPageBreakAfterTable($table, $dom);
+                }
+
+                $found = true;
+                Log::info('Found and processed approval table (编制/审核/批准) in HTML export');
+                break;
+            }
+        }
+
+        if (!$found) {
+            return $html;
+        }
+
+        $innerHtml = '';
+        foreach ($dom->childNodes as $child) {
+            if ($child instanceof \DOMProcessingInstruction) {
+                continue;
+            }
+            $innerHtml .= $dom->saveHTML($child);
+        }
+
+        return $innerHtml;
+    }
+
+    /**
+     * 查找审批表格后的"更改记录"相关表格。
+     * 如果审批表格后有"更改记录"标题，并且"更改记录"后紧跟一个表格，返回该表格。
+     *
+     * @param \DOMElement $approvalTable 审批表格元素
+     * @return \DOMElement|null 更改记录表格，如果没找到则返回null
+     */
+    private function findChangeRecordTable(\DOMElement $approvalTable): ?\DOMElement
+    {
+        $sibling = $approvalTable->nextSibling;
+        $changeRecordFound = false;
+        $pendingTable = null;
+
+        while ($sibling !== null) {
+            if ($sibling instanceof \DOMText && trim($sibling->textContent) !== '') {
+                if (preg_match('/更改记录/i', $sibling->textContent)) {
+                    $changeRecordFound = true;
+                    if ($pendingTable !== null) {
+                        return $pendingTable;
+                    }
+                }
+            } elseif ($sibling instanceof \DOMElement) {
+                if ($sibling->nodeName === 'table') {
+                    if ($changeRecordFound) {
+                        return $sibling;
+                    }
+                    $pendingTable = $sibling;
+                } else {
+                    if ($this->elementContainsText($sibling, '更改记录')) {
+                        $changeRecordFound = true;
+                        if ($pendingTable !== null) {
+                            return $pendingTable;
+                        }
+                    }
+                }
+            }
+
+            $sibling = $sibling->nextSibling;
+        }
+
+        return null;
+    }
+
+    /**
+     * 检查元素及其子元素是否包含指定文本。
+     */
+    private function elementContainsText(\DOMElement $element, string $searchText): bool
+    {
+        if (mb_strpos($element->textContent, $searchText) !== false) {
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * 检查表格是否为审批表格。
+     * 审批表格必须至少包含「编制」「审核」「批准」中的2个关键词。
+     *
+     * @param \DOMElement $table 表格元素
+     * @return bool 是否为审批表格
+     */
+    private function isApprovalTable(\DOMElement $table): bool
+    {
+        $text = $table->textContent;
+        $keywords = ['编制', '审核', '批准'];
+        $foundCount = 0;
+
+        foreach ($keywords as $keyword) {
+            if (mb_strpos($text, $keyword) !== false) {
+                $foundCount++;
+            }
+        }
+
+        return $foundCount >= 2;
+    }
+
+    /**
+     * 清除审批表格中各个单元格的填写内容。
+     * 保留标签（编制：、审核：、批准：、日期：），将标签后的内容替换为6个全角空格。
+     *
+     * 支持两种表格格式：
+     *   A) 标签和值在同一单元格：<td>编制：张三</td> → <td>编制：　　　　　　</td>
+     *   B) 标签和值在不同单元格：<td>编制</td><td>张三</td> → <td>编制：</td><td>　　　　　　</td>
+     *
+     * @param \DOMElement $table 表格元素
+     */
+    private function clearApprovalTableContent(\DOMElement $table): void
+    {
+        $placeholder = str_repeat('_', 10);
+
+        $labelKeywords = ['编制', '审核', '批准', '日期'];
+
+        $rows = $table->getElementsByTagName('tr');
+        foreach ($rows as $row) {
+            $cells = [];
+            foreach ($row->childNodes as $child) {
+                if ($child instanceof \DOMElement && in_array(strtolower($child->tagName), ['td', 'th'])) {
+                    $cells[] = $child;
+                }
+            }
+
+            $cellCount = count($cells);
+            for ($i = 0; $i < $cellCount; $i++) {
+                $cell = $cells[$i];
+                $text = trim($cell->textContent);
+
+                foreach ($labelKeywords as $keyword) {
+                    $fullContent = $keyword . '：' . $placeholder;
+
+                    if (preg_match('/^' . preg_quote($keyword, '/') . '\s*[：:]\s*\S+/u', $text)) {
+                        $this->replaceCellContentRecursive($cell, $keyword . '：', $placeholder);
+                        break;
+                    }
+
+                    if (preg_match('/^' . preg_quote($keyword, '/') . '\s*[：:]?\s*$/u', $text)) {
+                        $this->replaceCellContentRecursive($cell, $keyword . '：', $placeholder);
+                        for ($j = $i + 1; $j < $cellCount; $j++) {
+                            $nextText = trim($cells[$j]->textContent);
+                            $isNextLabel = false;
+                            foreach ($labelKeywords as $lk) {
+                                if (preg_match('/^' . preg_quote($lk, '/') . '\s*[：:]?\s*$/u', $nextText)) {
+                                    $isNextLabel = true;
+                                    break;
+                                }
+                            }
+                            if ($isNextLabel) {
+                                break;
+                            }
+                            $this->replaceCellContentRecursive($cells[$j], '', $placeholder);
+                            break;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    private function replaceCellContentRecursive(\DOMElement $cell, string $prefix, string $placeholder): void
+    {
+        $fullText = $prefix . $placeholder;
+
+        $hasNestedElements = false;
+        foreach ($cell->childNodes as $child) {
+            if ($child instanceof \DOMElement) {
+                $hasNestedElements = true;
+                break;
+            }
+        }
+
+        if (!$hasNestedElements) {
+            $this->replaceCellContent($cell, $fullText);
+            return;
+        }
+
+        $text = trim($cell->textContent);
+        $keywords = ['编制', '审核', '批准', '日期'];
+
+        foreach ($keywords as $keyword) {
+            $pattern = '/(' . preg_quote($keyword, '/') . '\s*[：:]\s*)\S.*/u';
+            if (preg_match($pattern, $text)) {
+                $text = preg_replace($pattern, $keyword . '：' . $placeholder, $text);
+                break;
+            }
+        }
+
+        if ($text === trim($cell->textContent)) {
+            $text = $fullText;
+        }
+
+        while ($cell->hasChildNodes()) {
+            $cell->removeChild($cell->firstChild);
+        }
+        $cell->appendChild($cell->ownerDocument->createTextNode($text));
+    }
+
+    /**
+     * 替换单元格的全部内容。
+     *
+     * @param \DOMElement $cell 单元格元素
+     * @param string $newContent 新的文本内容
+     */
+    private function replaceCellContent(\DOMElement $cell, string $newContent): void
+    {
+        while ($cell->hasChildNodes()) {
+            $cell->removeChild($cell->firstChild);
+        }
+        $cell->appendChild($cell->ownerDocument->createTextNode($newContent));
+    }
+
+    /**
+     * 在表格后添加分页段落，使表格往下的内容在新的一页展示。
+     * 使用不含空格的段落 + CSS page-break-before，pandoc 转换后为空段接新页。
+     *
+     * @param \DOMElement $table 表格元素
+     * @param \DOMDocument $dom DOM 文档对象
+     */
+    private function addPageBreakAfterTable(\DOMElement $table, \DOMDocument $dom): void
+    {
+        $pageBreakP = $dom->createElement('p');
+        $pageBreakP->setAttribute('style', 'page-break-before: always;');
+        $pageBreakP->appendChild($dom->createTextNode("\xC2\xA0"));
+
+        if ($table->nextSibling) {
+            $table->parentNode->insertBefore($pageBreakP, $table->nextSibling);
+        } else {
+            $table->parentNode->appendChild($pageBreakP);
+        }
+    }
+
+    /**
+     * 在 Word 文档中审批表格后添加分页。
+     * 通过直接操作 docx 的 OOXML 结构，在审批表格后的段落添加分页属性。
+     * 如果审批表格后有"更改记录"，分页点延迟到"更改记录"表格之后。
+     *
+     * @param string $docxPath Word 文档路径
+     */
+    private function addPageBreakAfterApprovalTableInDocx(string $docxPath): void
+    {
+        if (!class_exists('ZipArchive')) {
+            Log::warning('ZipArchive not available, cannot add page break after approval table');
+            return;
+        }
+
+        $zip = new ZipArchive();
+        if ($zip->open($docxPath, ZipArchive::CREATE) !== true) {
+            Log::error('Failed to open docx file for adding page break after approval table');
+            return;
+        }
+
+        $documentXml = $zip->getFromName('word/document.xml');
+        if ($documentXml === false) {
+            $zip->close();
+            Log::error('word/document.xml not found in docx');
+            return;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadXML($documentXml);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+
+        $wNs = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+        $tables = $xpath->query('//w:tbl');
+
+        foreach ($tables as $table) {
+            if ($this->isApprovalTableInDocx($table, $xpath)) {
+                $changeRecordParagraph = null;
+                $changeRecordTable = $this->findChangeRecordTableInDocx($table, $xpath, $changeRecordParagraph);
+                if ($changeRecordTable !== null) {
+                    if ($changeRecordParagraph !== null) {
+                        $paragraphFirst = $this->isElementBeforeInDocument($changeRecordParagraph, $changeRecordTable);
+
+                        if ($paragraphFirst) {
+                            $firstElement = $changeRecordParagraph;
+                            $lastElement = $changeRecordTable;
+                        } else {
+                            $firstElement = $changeRecordTable;
+                            $lastElement = $changeRecordParagraph;
+                        }
+
+                        $this->removePageBreaksBetweenElements($firstElement, $lastElement, $dom, $wNs);
+
+                        if ($firstElement->nodeName === 'w:p') {
+                            $this->addPageBreakBeforeParagraph($firstElement, $dom, $wNs);
+                        } else {
+                            $firstElement->parentNode->insertBefore(
+                                $this->createPageBreakParagraph($dom, $wNs),
+                                $firstElement
+                            );
+                        }
+
+                        if ($lastElement->nodeName === 'w:tbl') {
+                            $this->addPageBreakAfterTableInDocx($lastElement, $dom, $xpath, $wNs);
+                        } else {
+                            $nextSibling = $lastElement->nextSibling;
+                            $breakP = $this->createPageBreakParagraph($dom, $wNs);
+                            if ($nextSibling) {
+                                $lastElement->parentNode->insertBefore($breakP, $nextSibling);
+                            } else {
+                                $lastElement->parentNode->appendChild($breakP);
+                            }
+                        }
+                    } else {
+                        $this->addPageBreakAfterTableInDocx($changeRecordTable, $dom, $xpath, $wNs);
+                    }
+                    Log::info('Added page break before and after change record table in docx');
+                } else {
+                    $this->addPageBreakAfterTableInDocx($table, $dom, $xpath, $wNs);
+                    Log::info('Added page break after approval table in docx');
+                }
+                break;
+            }
+        }
+
+        $newXml = $dom->saveXML();
+        $zip->addFromString('word/document.xml', $newXml);
+        $zip->close();
+    }
+
+    /**
+     * 在 Word 文档中查找审批表格后的"更改记录"表格。
+     *
+     * @param \DOMElement $approvalTable 审批表格元素
+     * @param \DOMXPath $xpath DOM XPath 对象
+     * @param \DOMElement|null $changeRecordParagraph [输出] 包含"更改记录"的段落元素引用
+     * @return \DOMElement|null 更改记录表格，如果没找到则返回null
+     */
+    private function findChangeRecordTableInDocx(\DOMElement $approvalTable, \DOMXPath $xpath, ?\DOMElement &$changeRecordParagraph = null): ?\DOMElement
+    {
+        $sibling = $approvalTable->nextSibling;
+        $changeRecordFound = false;
+        $pendingTable = null;
+        $changeRecordParagraph = null;
+
+        while ($sibling !== null) {
+            if ($sibling instanceof \DOMElement) {
+                if ($sibling->nodeName === 'w:tbl') {
+                    if ($changeRecordFound) {
+                        return $sibling;
+                    }
+                    $pendingTable = $sibling;
+                } elseif ($sibling->nodeName === 'w:p') {
+                    $textContent = '';
+                    $textNodes = $xpath->query('.//w:t', $sibling);
+                    foreach ($textNodes as $t) {
+                        $textContent .= $t->textContent;
+                    }
+
+                    if (preg_match('/更改记录/i', $textContent)) {
+                        $changeRecordFound = true;
+                        $changeRecordParagraph = $sibling;
+                        if ($pendingTable !== null) {
+                            return $pendingTable;
+                        }
+                    }
+                }
+            }
+
+            $sibling = $sibling->nextSibling;
+        }
+
+        return null;
+    }
+
+    /**
+     * 检查 Word 文档中的表格是否为审批表格。
+     */
+    private function isApprovalTableInDocx(\DOMElement $table, \DOMXPath $xpath): bool
+    {
+        $textContent = '';
+        $textNodes = $xpath->query('.//w:t', $table);
+        foreach ($textNodes as $t) {
+            $textContent .= $t->textContent;
+        }
+
+        $keywords = ['编制', '审核', '批准'];
+        $foundCount = 0;
+        foreach ($keywords as $keyword) {
+            if (mb_strpos($textContent, $keyword) !== false) {
+                $foundCount++;
+            }
+        }
+
+        return $foundCount >= 2;
+    }
+
+    /**
+     * 在 Word 文档的表格后添加分页段落的实际逻辑。
+     */
+    private function addPageBreakAfterTableInDocx(\DOMElement $table, \DOMDocument $dom, \DOMXPath $xpath, string $wNs): void
+    {
+        $tableRows = $xpath->query('w:tr', $table);
+        if ($tableRows->length === 0) {
+            return;
+        }
+
+        $lastRow = $tableRows->item($tableRows->length - 1);
+        $lastRowCells = $xpath->query('w:tc', $lastRow);
+        if ($lastRowCells->length === 0) {
+            return;
+        }
+
+        $pageBreakParagraph = $dom->createElementNS($wNs, 'w:p');
+        $pageBreakPPr = $dom->createElementNS($wNs, 'w:pPr');
+        $pageBreakBefore = $dom->createElementNS($wNs, 'w:pageBreakBefore');
+        $pageBreakPPr->appendChild($pageBreakBefore);
+        $pageBreakParagraph->appendChild($pageBreakPPr);
+
+        $nextSibling = $table->nextSibling;
+        if ($nextSibling) {
+            $table->parentNode->insertBefore($pageBreakParagraph, $nextSibling);
+        } else {
+            $table->parentNode->appendChild($pageBreakParagraph);
+        }
+    }
+
+    /**
+     * 在 Word 文档的指定段落前添加分页属性。
+     * 通过给该段落的 w:pPr 添加 w:pageBreakBefore 元素实现。
+     *
+     * @param \DOMElement $paragraph 目标段落元素
+     * @param \DOMDocument $dom DOM 文档对象
+     * @param string $wNs WordprocessingML 命名空间
+     */
+    private function addPageBreakBeforeParagraph(\DOMElement $paragraph, \DOMDocument $dom, string $wNs): void
+    {
+        $pPr = null;
+        foreach ($paragraph->childNodes as $child) {
+            if ($child instanceof \DOMElement && $child->nodeName === 'w:pPr') {
+                $pPr = $child;
+                break;
+            }
+        }
+
+        if ($pPr === null) {
+            $pPr = $dom->createElementNS($wNs, 'w:pPr');
+            if ($paragraph->firstChild) {
+                $paragraph->insertBefore($pPr, $paragraph->firstChild);
+            } else {
+                $paragraph->appendChild($pPr);
+            }
+        }
+
+        $pageBreakBefore = $dom->createElementNS($wNs, 'w:pageBreakBefore');
+        $pPr->appendChild($pageBreakBefore);
+    }
+
+    /**
+     * 判断两个同级 DOM 元素在文档中的顺序。
+     * 通过遍历 sibling 链表来判断 a 是否在 b 之前。
+     *
+     * @param \DOMElement $a 第一个元素
+     * @param \DOMElement $b 第二个元素
+     * @return bool true 表示 $a 在 $b 之前
+     */
+    private function isElementBeforeInDocument(\DOMElement $a, \DOMElement $b): bool
+    {
+        $sibling = $a->nextSibling;
+        while ($sibling !== null) {
+            if ($sibling === $b) {
+                return true;
+            }
+            $sibling = $sibling->nextSibling;
+        }
+        return false;
+    }
+
+    /**
+     * 创建一个带 w:pageBreakBefore 属性的分页段落。
+     *
+     * @param \DOMDocument $dom DOM 文档对象
+     * @param string $wNs WordprocessingML 命名空间
+     * @return \DOMElement 创建的分页段落元素
+     */
+    private function createPageBreakParagraph(\DOMDocument $dom, string $wNs): \DOMElement
+    {
+        $p = $dom->createElementNS($wNs, 'w:p');
+        $pPr = $dom->createElementNS($wNs, 'w:pPr');
+        $pageBreakBefore = $dom->createElementNS($wNs, 'w:pageBreakBefore');
+        $pPr->appendChild($pageBreakBefore);
+        $p->appendChild($pPr);
+        return $p;
+    }
+
+    /**
+     * 移除两个同级 DOM 元素之间所有带分页属性的 w:p 段落。
+     * 用于在"更改记录"段落和其表格之间清理被 preventTableBreakAcrossPages
+     * 误插入的分页段落，确保段落和表格连续排版在同一页面。
+     *
+     * @param \DOMElement $startElement 起始元素（不含）
+     * @param \DOMElement $endElement 结束元素（不含）
+     * @param \DOMDocument $dom DOM 文档对象
+     * @param string $wNs WordprocessingML 命名空间
+     */
+    private function removePageBreaksBetweenElements(\DOMElement $startElement, \DOMElement $endElement, \DOMDocument $dom, string $wNs): void
+    {
+        $nodesToRemove = [];
+        $sibling = $startElement->nextSibling;
+
+        while ($sibling !== null && $sibling !== $endElement) {
+            if ($sibling instanceof \DOMElement && $sibling->nodeName === 'w:p') {
+                $pPrNodes = $sibling->getElementsByTagNameNS($wNs, 'pPr');
+                if ($pPrNodes->length > 0) {
+                    $pageBreaks = $pPrNodes->item(0)->getElementsByTagNameNS($wNs, 'pageBreakBefore');
+                    if ($pageBreaks->length > 0) {
+                        $nodesToRemove[] = $sibling;
+                    }
+                }
+            }
+            $sibling = $sibling->nextSibling;
+        }
+
+        foreach ($nodesToRemove as $node) {
+            $node->parentNode->removeChild($node);
+        }
+    }
+
+    /**
+     * 处理 Markdown 内容中的审批表格（编制/审核/批准）。
+     * 用于 Markdown 导出路径，当 HTML 表格被转换为 Markdown 表格格式后调用。
+     * 检测 Markdown 表格中的审批关键词，清除填写内容并添加分页。
+     *
+     * @param string $markdown Markdown 内容
+     * @return string 处理后的 Markdown
+     */
+    private function processApprovalTableInMarkdown(string $markdown): string
+    {
+        $keywords = ['编制', '审核', '批准'];
+        $foundCount = 0;
+        foreach ($keywords as $kw) {
+            if (mb_strpos($markdown, $kw) !== false) {
+                $foundCount++;
+            }
+        }
+        if ($foundCount < 2) {
+            return $markdown;
+        }
+
+        $lines = explode("\n", $markdown);
+        $inTable = false;
+        $tableStartIndex = -1;
+        $tableLines = [];
+        $fixedLines = [];
+
+        foreach ($lines as $index => $line) {
+            $trimmed = trim($line);
+
+            $isTableRow = preg_match('/^\|.+\\|$/', $trimmed) && strpos($trimmed, '---') === false && strpos($trimmed, ':--') === false && !preg_match('/^\|[\s\-:]+\|$/', $trimmed);
+            $isSeparator = preg_match('/^\|[\s\-:]+\|$/', $trimmed);
+
+            if ($isTableRow && !$inTable) {
+                $inTable = true;
+                $tableStartIndex = count($fixedLines);
+                $tableLines = [$line];
+            } elseif (($isTableRow || $isSeparator) && $inTable) {
+                $tableLines[] = $line;
+            } elseif ($inTable) {
+                $tableText = implode("\n", $tableLines);
+                $isApproval = false;
+                foreach ($keywords as $kw) {
+                    if (mb_strpos($tableText, $kw) !== false) {
+                        $isApproval = true;
+                        break;
+                    }
+                }
+
+                if ($isApproval) {
+                    $clearedLines = $this->clearApprovalMarkdownTableLines($tableLines);
+                    $fixedLines = array_merge($fixedLines, $clearedLines);
+                    $fixedLines[] = '';
+                    $fixedLines[] = '\newpage';
+                    $fixedLines[] = '';
+                    Log::info('Found and processed approval table in Markdown export');
+                } else {
+                    $fixedLines = array_merge($fixedLines, $tableLines);
+                }
+
+                $fixedLines[] = $line;
+                $inTable = false;
+                $tableLines = [];
+            } else {
+                $fixedLines[] = $line;
+            }
+        }
+
+        if ($inTable && !empty($tableLines)) {
+            $tableText = implode("\n", $tableLines);
+            $isApproval = false;
+            foreach ($keywords as $kw) {
+                if (mb_strpos($tableText, $kw) !== false) {
+                    $isApproval = true;
+                    break;
+                }
+            }
+
+            if ($isApproval) {
+                $clearedLines = $this->clearApprovalMarkdownTableLines($tableLines);
+                $fixedLines = array_merge($fixedLines, $clearedLines);
+                $fixedLines[] = '';
+                $fixedLines[] = '\newpage';
+                $fixedLines[] = '';
+                Log::info('Found and processed approval table in Markdown export (end of content)');
+            } else {
+                $fixedLines = array_merge($fixedLines, $tableLines);
+            }
+        }
+
+        return implode("\n", $fixedLines);
+    }
+
+    /**
+     * 清除 Markdown 审批表格行中的填写内容。
+     * 保留标签（编制：、审核：、批准：、日期：），将标签后的内容替换为6个全角空格。
+     *
+     * 支持两种表格格式：
+     *   A) 标签和值在同一单元格：| 编制：张三 | → | 编制：　　　　　　|
+     *   B) 标签和值在不同单元格：| 编制 | 张三 | → | 编制： | 　　　　　　|
+     *
+     * @param array $tableLines Markdown 表格行数组
+     * @return array 处理后的表格行
+     */
+    private function clearApprovalMarkdownTableLines(array $tableLines): array
+    {
+        $fullwidthSpace = '　';
+        $placeholder = str_repeat($fullwidthSpace, 6);
+        $labelKeywords = ['编制', '审核', '批准', '日期'];
+
+        $result = [];
+        foreach ($tableLines as $line) {
+            $trimmed = trim($line);
+
+            // 分隔行保持不变
+            if (preg_match('/^\|[\s\-:]+\|$/', $trimmed)) {
+                $result[] = $line;
+                continue;
+            }
+
+            $cells = explode('|', $trimmed);
+            $cells = array_map('trim', $cells);
+            // 过滤首尾空元素
+            $cells = array_values(array_filter($cells, function ($c, $i) use ($cells) {
+                return $c !== '' || ($i > 0 && $i < count($cells) - 1);
+            }, ARRAY_FILTER_USE_BOTH));
+
+            $cellCount = count($cells);
+            $modifiedCells = $cells;
+            $skipIndexes = [];
+
+            for ($i = 0; $i < $cellCount; $i++) {
+                if (isset($skipIndexes[$i])) {
+                    continue;
+                }
+
+                $cell = $cells[$i];
+                if ($cell === '') {
+                    continue;
+                }
+
+                foreach ($labelKeywords as $keyword) {
+                    // 情况A：标签+值在同一单元格，如 "编制：张三"
+                    if (preg_match('/^' . preg_quote($keyword, '/') . '\s*[：:]\s*(.+)/u', $cell)) {
+                        $modifiedCells[$i] = $keyword . '：' . $placeholder;
+                        break;
+                    }
+
+                    // 情况B：单元格只有标签文本，如 "编制" 或 "编制："
+                    if (preg_match('/^' . preg_quote($keyword, '/') . '\s*[：:]?\s*$/u', $cell)) {
+                        $modifiedCells[$i] = $keyword . '：';
+
+                        // 清空右侧相邻的值单元格
+                        for ($j = $i + 1; $j < $cellCount; $j++) {
+                            $nextCell = $cells[$j];
+                            if ($nextCell === '') {
+                                continue;
+                            }
+                            $isNextLabel = false;
+                            foreach ($labelKeywords as $lk) {
+                                if (preg_match('/^' . preg_quote($lk, '/') . '\s*[：:]?\s*$/u', $nextCell)) {
+                                    $isNextLabel = true;
+                                    break;
+                                }
+                            }
+                            if ($isNextLabel) {
+                                break;
+                            }
+                            $modifiedCells[$j] = $placeholder;
+                            $skipIndexes[$j] = true;
+                            break;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            $result[] = '| ' . implode(' | ', $modifiedCells) . ' |';
+        }
+
+        return $result;
     }
 
     /**
@@ -2687,6 +3436,9 @@ HTML;
 
         // ----- 6.1 后处理：防止表格跨页分割 -----
         $this->preventTableBreakAcrossPages($outputDocx);
+
+        // ----- 6.2 后处理：审批表格后添加分页 -----
+        $this->addPageBreakAfterApprovalTableInDocx($outputDocx);
 
         // ----- 7. 后处理：设置所有表格居中 -----
         $this->centerTablesInDocx($outputDocx);
