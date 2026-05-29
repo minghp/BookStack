@@ -1099,6 +1099,8 @@ class PageController extends Controller
         $this->regenerateTableOfContentsInDocx($outputDocx);
         $this->applyFirstParagraphStyleToDocx($outputDocx);
         $this->centerTablesInDocx($outputDocx);
+        $this->formatTableHeadersInDocx($outputDocx);
+        $this->removeIndentFromTableCellsInDocx($outputDocx);
         $this->setWideTablesToLandscape($outputDocx);
         $this->adjustTableColumnWidthsByContent($outputDocx);
 
@@ -3191,8 +3193,10 @@ HTML;
     {
         $colWidths = array_fill(0, $columnCount, 0);
         $rows = $xpath->query('w:tr', $table);
+        $rowIndex = 0;
 
         foreach ($rows as $row) {
+            $headerWeight = ($rowIndex === 0) ? 4.5 : 1.0;
             $cells = $xpath->query('w:tc', $row);
             $colIndex = 0;
             foreach ($cells as $cell) {
@@ -3249,7 +3253,7 @@ HTML;
                     }
                 }
 
-                $charWidth = max(1.0, $charWidth);
+                $charWidth = max(1.0, $charWidth) * $headerWeight;
 
                 if ($colspan <= 1) {
                     $colWidths[$colIndex] = max($colWidths[$colIndex], $charWidth);
@@ -3262,6 +3266,7 @@ HTML;
 
                 $colIndex += $colspan;
             }
+            $rowIndex++;
         }
 
         return $colWidths;
@@ -3638,13 +3643,159 @@ HTML;
     }
 
     /**
+     * 设置所有表格的表头行（第一行）文字居中对齐。
+     * 通过修改 word/document.xml 中表头单元格的 <w:pPr> 元素实现。
+     */
+    private function formatTableHeadersInDocx(string $docxPath): void
+    {
+        if (!class_exists('ZipArchive')) {
+            Log::warning('ZipArchive not available, cannot format table headers');
+            return;
+        }
+
+        $zip = new ZipArchive();
+        if ($zip->open($docxPath, ZipArchive::CREATE) !== true) {
+            Log::error('Failed to open docx file for formatting table headers', ['path' => $docxPath]);
+            return;
+        }
+
+        $documentXml = $zip->getFromName('word/document.xml');
+        if ($documentXml === false) {
+            $zip->close();
+            Log::error('word/document.xml not found in docx');
+            return;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadXML($documentXml);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+
+        $tables = $xpath->query('//w:tbl');
+        if ($tables->length === 0) {
+            $zip->close();
+            return;
+        }
+
+        $wNs = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+        $headerRowsProcessed = 0;
+
+        foreach ($tables as $table) {
+            $rows = $xpath->query('w:tr', $table);
+            if ($rows->length === 0) {
+                continue;
+            }
+
+            $headerRow = $rows->item(0);
+            $cells = $xpath->query('w:tc', $headerRow);
+
+            foreach ($cells as $cell) {
+                $paragraphs = $xpath->query('.//w:p', $cell);
+                foreach ($paragraphs as $paragraph) {
+                    $pPr = $xpath->query('w:pPr', $paragraph)->item(0);
+                    if (!$pPr) {
+                        $pPr = $dom->createElementNS($wNs, 'w:pPr');
+                        $paragraph->insertBefore($pPr, $paragraph->firstChild);
+                    }
+
+                    $jc = $xpath->query('w:jc', $pPr)->item(0);
+                    if (!$jc) {
+                        $jc = $dom->createElementNS($wNs, 'w:jc');
+                        $pPr->appendChild($jc);
+                    }
+                    $jc->setAttribute('w:val', 'center');
+                }
+            }
+
+            $headerRowsProcessed++;
+        }
+
+        $newXml = $dom->saveXML();
+        $zip->addFromString('word/document.xml', $newXml);
+        $zip->close();
+
+        Log::info('Formatted table headers in docx', [
+            'tables_count' => $tables->length,
+            'header_rows_processed' => $headerRowsProcessed,
+            'path' => $docxPath
+        ]);
+    }
+
+    /**
+     * 移除所有表格单元格内段落的缩进（w:ind 元素）。
+     * 通过修改 word/document.xml 中表格单元格内的 <w:pPr> 实现。
+     */
+    private function removeIndentFromTableCellsInDocx(string $docxPath): void
+    {
+        if (!class_exists('ZipArchive')) {
+            Log::warning('ZipArchive not available, cannot remove indent from table cells');
+            return;
+        }
+
+        $zip = new ZipArchive();
+        if ($zip->open($docxPath, ZipArchive::CREATE) !== true) {
+            Log::error('Failed to open docx file for removing table cell indent', ['path' => $docxPath]);
+            return;
+        }
+
+        $documentXml = $zip->getFromName('word/document.xml');
+        if ($documentXml === false) {
+            $zip->close();
+            Log::error('word/document.xml not found in docx');
+            return;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadXML($documentXml);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+
+        $paragraphs = $xpath->query('//w:tc//w:p');
+        $removedCount = 0;
+
+        foreach ($paragraphs as $paragraph) {
+            $pPr = $xpath->query('w:pPr', $paragraph)->item(0);
+            if (!$pPr) {
+                continue;
+            }
+
+            $ind = $xpath->query('w:ind', $pPr)->item(0);
+            if ($ind) {
+                $pPr->removeChild($ind);
+                $removedCount++;
+            }
+        }
+
+        if ($removedCount > 0) {
+            $newXml = $dom->saveXML();
+            $zip->addFromString('word/document.xml', $newXml);
+        }
+
+        $zip->close();
+
+        Log::info('Removed indent from table cell paragraphs in docx', [
+            'removed_count' => $removedCount,
+            'path' => $docxPath
+        ]);
+    }
+
+    /**
      * 识别 Word 文档中的目录（TOC），删除旧目录，并根据文档中的一级和二级标题重新生成目录。
      *
      * 处理逻辑：
-     * 1. 查找文档中是否存在"目录"标题段落
-     * 2. 如果存在，删除旧目录内容（从"目录"标题到下一个标题之间的所有段落）
+     * 1. 查找文档中的"目录"段落（支持多种检测方式）
+     *    - 首先尝试查找带有标题样式且文字为"目录"的段落
+     *    - 如果没找到，在文档前30个段落范围内查找包含"目录"的段落
+     *    - 如果还没找到，在整个文档中查找包含"目录"的段落
+     * 2. 如果存在目录，删除目录内容（从"目录"标题到下一个标题之间的所有段落）
      * 3. 扫描文档收集所有一级标题（Heading1）和二级标题（Heading2）
-     * 4. 在旧目录位置生成新目录，只包含一级和二级标题
+     * 4. 在原目录位置生成新目录，只包含一级和二级标题
      */
     private function regenerateTableOfContentsInDocx(string $docxPath): void
     {
@@ -3676,7 +3827,6 @@ HTML;
 
         $wNs = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
 
-        // Step 1: Find the TOC heading (paragraph containing "目录" with heading style)
         $body = $xpath->query('//w:body')->item(0);
         if (!$body) {
             $zip->close();
@@ -3687,7 +3837,21 @@ HTML;
         $tocHeadingIndex = -1;
         $tocHeadingElement = null;
 
+        $paragraphArray = [];
         foreach ($allParagraphs as $index => $paragraph) {
+            $paragraphArray[] = [
+                'index' => $index,
+                'element' => $paragraph
+            ];
+        }
+
+        $candidateTocElement = null;
+        $candidateTocIndex = -1;
+
+        foreach ($paragraphArray as $item) {
+            $index = $item['index'];
+            $paragraph = $item['element'];
+
             $pPr = $xpath->query('w:pPr', $paragraph)->item(0);
             $pStyle = $pPr ? $xpath->query('w:pStyle', $pPr)->item(0) : null;
             $styleVal = $pStyle ? $pStyle->getAttribute('w:val') : '';
@@ -3705,6 +3869,16 @@ HTML;
                 $tocHeadingElement = $paragraph;
                 break;
             }
+
+            if (trim($textContent) === '目录' && $candidateTocElement === null) {
+                $candidateTocElement = $paragraph;
+                $candidateTocIndex = $index;
+            }
+        }
+
+        if ($tocHeadingElement === null && $candidateTocElement !== null) {
+            $tocHeadingElement = $candidateTocElement;
+            $tocHeadingIndex = $candidateTocIndex;
         }
 
         if ($tocHeadingElement === null) {
@@ -3715,12 +3889,13 @@ HTML;
 
         Log::info('Found TOC heading, will remove old TOC and regenerate', ['index' => $tocHeadingIndex]);
 
-        // Step 2: Remove the TOC heading and all content until the next heading
         $nodesToRemove = [];
         $nodesToRemove[] = $tocHeadingElement;
 
         $nextSibling = $tocHeadingElement->nextSibling;
         $insertAfter = null;
+        $foundNextHeading = false;
+
         while ($nextSibling) {
             if ($nextSibling->nodeType === XML_ELEMENT_NODE) {
                 if ($nextSibling->nodeName === 'w:p') {
@@ -3730,6 +3905,7 @@ HTML;
 
                     if (strpos($styleVal, 'Heading') === 0) {
                         $insertAfter = $nextSibling;
+                        $foundNextHeading = true;
                         break;
                     }
                 }
@@ -3739,14 +3915,15 @@ HTML;
         }
 
         foreach ($nodesToRemove as $node) {
-            $node->parentNode->removeChild($node);
+            if ($node->parentNode) {
+                $node->parentNode->removeChild($node);
+            }
         }
 
         Log::info('Removed old TOC content', ['nodes_removed' => count($nodesToRemove)]);
 
-        // Step 3: Collect all Heading1 and Heading2 paragraphs from remaining content
-        $headings = [];
         $remainingParagraphs = $xpath->query('//w:body/w:p');
+        $headings = [];
 
         foreach ($remainingParagraphs as $paragraph) {
             $pPr = $xpath->query('w:pPr', $paragraph)->item(0);
@@ -3771,11 +3948,9 @@ HTML;
 
         Log::info('Collected headings for TOC', ['count' => count($headings)]);
 
-        // Step 4: Generate new TOC heading and entries
         $headingCounter1 = 0;
         $headingCounter2 = 0;
 
-        // Create and insert new TOC heading paragraph
         $tocHeadingNew = $dom->createElementNS($wNs, 'w:p');
 
         $tocPPr = $dom->createElementNS($wNs, 'w:pPr');
@@ -3804,11 +3979,11 @@ HTML;
         $tocRun->appendChild($tocText);
         $tocHeadingNew->appendChild($tocRun);
 
-        // Insert before the reference point or at end of body
+        $firstChild = $body->firstChild;
+
         if ($insertAfter) {
             $body->insertBefore($tocHeadingNew, $insertAfter);
         } else {
-            $firstChild = $body->firstChild;
             if ($firstChild) {
                 $body->insertBefore($tocHeadingNew, $firstChild);
             } else {
@@ -3818,7 +3993,6 @@ HTML;
 
         $insertRef = $insertAfter ?: null;
 
-        // Generate TOC entries for each heading
         foreach ($headings as $heading) {
             if ($heading['level'] === 1) {
                 $headingCounter1++;
@@ -3866,7 +4040,6 @@ HTML;
             }
         }
 
-        // Save back
         $newXml = $dom->saveXML();
         $zip->addFromString('word/document.xml', $newXml);
         $zip->close();
@@ -4015,6 +4188,12 @@ HTML;
 
         // ----- 7. 后处理：设置所有表格居中 -----
         $this->centerTablesInDocx($outputDocx);
+
+        // ----- 7.1 后处理：设置表格表头居中且不换行 -----
+        $this->formatTableHeadersInDocx($outputDocx);
+
+        // ----- 7.2 后处理：移除表格单元格内容段落缩进 -----
+        $this->removeIndentFromTableCellsInDocx($outputDocx);
 
         // ----- 8. 后处理：将列数超过10列的表格设置为横向布局 -----
         $this->setWideTablesToLandscape($outputDocx);
@@ -4421,7 +4600,7 @@ HTML;
         $headingTags = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'];
         $paragraphTags = ['p'];
 
-        $paragraphs = $xpath->query('//p');
+        $paragraphs = $xpath->query('//p[not(ancestor::td) and not(ancestor::th)]');
         $modifiedCount = 0;
 
         foreach ($paragraphs as $node) {
@@ -4543,10 +4722,12 @@ HTML;
     .page-content td {
         border: 1px solid #000000;
         padding: 8px 12px;
+        text-indent: 0;
     }
     .page-content th {
         background-color: #f2f2f2;
         font-weight: bold;
+        text-align: center;
     }
     .page-content pre,
     .page-content code {
@@ -4587,6 +4768,7 @@ HTML;
     }
     td, th {
         padding: 4px 8px;
+        text-indent: 0;
     }
 
     /* 预格式文本保留空白 */
