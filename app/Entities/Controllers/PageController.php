@@ -1096,9 +1096,11 @@ class PageController extends Controller
         $this->addTableBordersToDocx($outputDocx);
         $this->preventTableBreakAcrossPages($outputDocx);
         $this->centerHeadingsInDocx($outputDocx);
+        $this->regenerateTableOfContentsInDocx($outputDocx);
         $this->applyFirstParagraphStyleToDocx($outputDocx);
         $this->centerTablesInDocx($outputDocx);
         $this->setWideTablesToLandscape($outputDocx);
+        $this->adjustTableColumnWidthsByContent($outputDocx);
 
         if (!file_exists($outputDocx) || filesize($outputDocx) === 0) {
             throw new \Exception('Generated Word document is empty or does not exist');
@@ -1408,7 +1410,7 @@ HTML;
      */
     private function clearApprovalTableContent(\DOMElement $table): void
     {
-        $placeholder = str_repeat('_', 10);
+        $placeholder = str_repeat('', 1);
 
         $labelKeywords = ['编制', '审核', '批准', '日期'];
 
@@ -3207,29 +3209,52 @@ HTML;
                     }
                 }
 
+                $hasBold = false;
+                $rPrNodes = $xpath->query('.//w:rPr', $cell);
+                foreach ($rPrNodes as $rPr) {
+                    $bNodes = $xpath->query('w:b', $rPr);
+                    if ($bNodes->length > 0) {
+                        $bVal = $bNodes->item(0)->getAttribute('w:val');
+                        if ($bVal !== '0' && $bVal !== 'false') {
+                            $hasBold = true;
+                            break;
+                        }
+                    }
+                    $bCsNodes = $xpath->query('w:bCs', $rPr);
+                    if ($bCsNodes->length > 0) {
+                        $bCsVal = $bCsNodes->item(0)->getAttribute('w:val');
+                        if ($bCsVal !== '0' && $bCsVal !== 'false') {
+                            $hasBold = true;
+                            break;
+                        }
+                    }
+                }
+
+                $boldMultiplier = $hasBold ? 1.35 : 1.0;
+
                 $textContent = '';
                 $textNodes = $xpath->query('.//w:t', $cell);
                 foreach ($textNodes as $t) {
                     $textContent .= $t->textContent;
                 }
 
-                $charWidth = 0;
+                $charWidth = 0.0;
                 $chars = mb_str_split($textContent ?: '');
                 foreach ($chars as $ch) {
                     $ord = mb_ord($ch);
                     if ($ord >= 0x4E00 && $ord <= 0x9FFF || $ord >= 0x3000 && $ord <= 0x303F || $ord >= 0xFF00 && $ord <= 0xFFEF) {
-                        $charWidth += 2;
+                        $charWidth += 2 * $boldMultiplier;
                     } else {
-                        $charWidth += 1;
+                        $charWidth += 1 * $boldMultiplier;
                     }
                 }
 
-                $charWidth = max(1, $charWidth);
+                $charWidth = max(1.0, $charWidth);
 
                 if ($colspan <= 1) {
                     $colWidths[$colIndex] = max($colWidths[$colIndex], $charWidth);
                 } else {
-                    $perColWidth = intval($charWidth / $colspan);
+                    $perColWidth = $charWidth / $colspan;
                     for ($j = 0; $j < $colspan && ($colIndex + $j) < $columnCount; $j++) {
                         $colWidths[$colIndex + $j] = max($colWidths[$colIndex + $j], $perColWidth);
                     }
@@ -3240,6 +3265,297 @@ HTML;
         }
 
         return $colWidths;
+    }
+
+    /**
+     * 获取表格的当前总宽度（twips）。
+     * 优先从 w:tblPr/w:tblW 读取，如果不存在则从 w:tblGrid 的 gridCol 总和计算。
+     */
+    private function getTableTotalWidth(\DOMElement $table, \DOMXPath $xpath): int
+    {
+        $tblPr = $xpath->query('w:tblPr', $table)->item(0);
+        if ($tblPr) {
+            $tblW = $xpath->query('w:tblW', $tblPr)->item(0);
+            if ($tblW) {
+                $type = $tblW->getAttribute('w:type');
+                $width = intval($tblW->getAttribute('w:w'));
+                if ($type === 'dxa' && $width > 0) {
+                    return $width;
+                }
+            }
+        }
+
+        $tblGrid = $xpath->query('w:tblGrid', $table)->item(0);
+        if ($tblGrid) {
+            $totalWidth = 0;
+            $gridCols = $xpath->query('w:gridCol', $tblGrid);
+            foreach ($gridCols as $gridCol) {
+                $totalWidth += intval($gridCol->getAttribute('w:w'));
+            }
+            if ($totalWidth > 0) {
+                return $totalWidth;
+            }
+        }
+
+        return 9026;
+    }
+
+    /**
+     * 将计算好的列宽写入表格的 tblGrid 和各单元格的 tcW 中。
+     */
+    private function writeTableColumnWidths(\DOMElement $table, \DOMXPath $xpath, array $colWidths, int $columnCount, int $totalWidth): void
+    {
+        $wNs = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+
+        $tblPr = $xpath->query('w:tblPr', $table)->item(0);
+        if (!$tblPr) {
+            $tblPr = $table->ownerDocument->createElementNS($wNs, 'w:tblPr');
+            $table->insertBefore($tblPr, $table->firstChild);
+        }
+
+        $tblW = $xpath->query('w:tblW', $tblPr)->item(0);
+        if (!$tblW) {
+            $tblW = $table->ownerDocument->createElementNS($wNs, 'w:tblW');
+            $tblPr->appendChild($tblW);
+        }
+        $tblW->setAttribute('w:w', strval($totalWidth));
+        $tblW->setAttribute('w:type', 'dxa');
+
+        $tblGrid = $xpath->query('w:tblGrid', $table)->item(0);
+        if (!$tblGrid) {
+            $tblGrid = $table->ownerDocument->createElementNS($wNs, 'w:tblGrid');
+            $table->insertBefore($tblGrid, $table->firstChild);
+        } else {
+            $existingGrids = $xpath->query('w:gridCol', $tblGrid);
+            foreach ($existingGrids as $gridCol) {
+                $tblGrid->removeChild($gridCol);
+            }
+        }
+
+        for ($i = 0; $i < $columnCount; $i++) {
+            $gridCol = $table->ownerDocument->createElementNS($wNs, 'w:gridCol');
+            $gridCol->setAttribute('w:w', strval($colWidths[$i]));
+            $tblGrid->appendChild($gridCol);
+        }
+
+        $rows = $xpath->query('w:tr', $table);
+        foreach ($rows as $row) {
+            $trPr = $xpath->query('w:trPr', $row)->item(0);
+            if (!$trPr) {
+                $trPr = $table->ownerDocument->createElementNS($wNs, 'w:trPr');
+                $row->insertBefore($trPr, $row->firstChild);
+            }
+
+            $trHeights = $xpath->query('w:trHeight', $trPr);
+            foreach ($trHeights as $h) {
+                $trPr->removeChild($h);
+            }
+
+            $trHeight = $table->ownerDocument->createElementNS($wNs, 'w:trHeight');
+            $trHeight->setAttribute('w:val', '280');
+            $trHeight->setAttribute('w:hRule', 'atLeast');
+            $trPr->appendChild($trHeight);
+
+            $cells = $xpath->query('w:tc', $row);
+            $colIndex = 0;
+            foreach ($cells as $cell) {
+                $colspan = 1;
+                $tcPr = $xpath->query('w:tcPr', $cell)->item(0);
+                if ($tcPr) {
+                    $gridSpan = $xpath->query('w:gridSpan', $tcPr)->item(0);
+                    if ($gridSpan) {
+                        $colspan = intval($gridSpan->getAttribute('w:val')) ?: 1;
+                    }
+                }
+
+                $combinedWidth = 0;
+                for ($j = 0; $j < $colspan && ($colIndex + $j) < $columnCount; $j++) {
+                    $combinedWidth += $colWidths[$colIndex + $j];
+                }
+
+                if (!$tcPr) {
+                    $tcPr = $table->ownerDocument->createElementNS($wNs, 'w:tcPr');
+                    $cell->insertBefore($tcPr, $cell->firstChild);
+                }
+
+                $tcW = $xpath->query('w:tcW', $tcPr)->item(0);
+                if (!$tcW) {
+                    $tcW = $table->ownerDocument->createElementNS($wNs, 'w:tcW');
+                    $tcPr->appendChild($tcW);
+                }
+                $tcW->setAttribute('w:w', strval($combinedWidth));
+                $tcW->setAttribute('w:type', 'dxa');
+
+                $colIndex += $colspan;
+            }
+        }
+    }
+
+    /**
+     * 计算每列内容展示所需的最小 twips 宽度。
+     * 多策略检测字体大小，将内容字符单位转换为真实 twips，
+     * 加上加粗文本加成、安全系数和单元格内边距，确保标题和内容完整展示。
+     */
+    private function calculateColumnMinWidths(\DOMElement $table, \DOMXPath $xpath, int $columnCount): array
+    {
+        $fontSizeHalfPt = 20;
+
+        $allSzNodes = $xpath->query('.//w:rPr/w:sz', $table);
+        foreach ($allSzNodes as $sz) {
+            $val = intval($sz->getAttribute('w:val'));
+            if ($val > 0) {
+                $fontSizeHalfPt = $val;
+                break;
+            }
+        }
+
+        if ($fontSizeHalfPt === 20) {
+            $docDefaults = $xpath->query('//w:docDefaults/w:rPrDefault/w:rPr/w:sz');
+            if ($docDefaults->length > 0) {
+                $val = intval($docDefaults->item(0)->getAttribute('w:val'));
+                if ($val > 0) {
+                    $fontSizeHalfPt = $val;
+                }
+            }
+        }
+
+        if ($fontSizeHalfPt === 20) {
+            $styles = $xpath->query('//w:style[@w:type="paragraph"]/w:rPr/w:sz');
+            if ($styles->length > 0) {
+                $val = intval($styles->item(0)->getAttribute('w:val'));
+                if ($val > 0) {
+                    $fontSizeHalfPt = $val;
+                }
+            }
+        }
+
+        $twipsPerUnit = $fontSizeHalfPt * 5;
+
+        $cellMarginLeft = 144;
+        $cellMarginRight = 144;
+        $cellPadding = $cellMarginLeft + $cellMarginRight;
+
+        $colContentWidths = $this->calculateColumnContentWidths($table, $xpath, $columnCount);
+
+        $safetyFactor = 1.2;
+
+        $minWidths = [];
+        foreach ($colContentWidths as $i => $cw) {
+            $minWidths[$i] = intval($cw * $twipsPerUnit * $safetyFactor) + $cellPadding;
+        }
+
+        return $minWidths;
+    }
+
+    /**
+     * 根据内容自适应调整所有表格的列宽，保持表格总宽度不变。
+     * 先为每列分配满足内容展示的最小宽度，再将剩余宽度按内容比例分配。
+     * 同时设置行高为 atLeast 模式，确保内容完整展示且行高紧凑。
+     */
+    private function adjustTableColumnWidthsByContent(string $docxPath): void
+    {
+        if (!class_exists('ZipArchive')) {
+            Log::warning('ZipArchive not available, cannot adjust table column widths');
+            return;
+        }
+
+        $zip = new ZipArchive();
+        if ($zip->open($docxPath, ZipArchive::CREATE) !== true) {
+            Log::error('Failed to open docx file for adjusting table column widths', ['path' => $docxPath]);
+            return;
+        }
+
+        $documentXml = $zip->getFromName('word/document.xml');
+        if ($documentXml === false) {
+            $zip->close();
+            Log::error('word/document.xml not found in docx');
+            return;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadXML($documentXml);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+
+        $tables = $xpath->query('//w:tbl');
+        if ($tables->length === 0) {
+            $zip->close();
+            return;
+        }
+
+        $adjustedCount = 0;
+
+        foreach ($tables as $table) {
+            $columnCount = $this->getTableColumnCount($table, $xpath);
+            if ($columnCount <= 1) {
+                continue;
+            }
+
+            $totalWidth = $this->getTableTotalWidth($table, $xpath);
+            if ($totalWidth <= 0) {
+                continue;
+            }
+
+            $colContentWidths = $this->calculateColumnContentWidths($table, $xpath, $columnCount);
+            $totalContentWidth = array_sum($colContentWidths);
+            if ($totalContentWidth <= 0) {
+                $totalContentWidth = $columnCount;
+                $colContentWidths = array_fill(0, $columnCount, 1);
+            }
+
+            $colMinWidths = $this->calculateColumnMinWidths($table, $xpath, $columnCount);
+            $totalMinWidth = array_sum($colMinWidths);
+
+            if ($totalMinWidth > $totalWidth) {
+                $scale = $totalWidth / $totalMinWidth;
+                foreach ($colMinWidths as $i => $w) {
+                    $colMinWidths[$i] = intval($w * $scale);
+                }
+                $colWidths = $colMinWidths;
+            } else {
+                $remainingWidth = $totalWidth - $totalMinWidth;
+
+                $colWidths = [];
+                foreach ($colMinWidths as $i => $minW) {
+                    $extra = intval(($colContentWidths[$i] / $totalContentWidth) * $remainingWidth);
+                    $colWidths[$i] = $minW + $extra;
+                }
+            }
+
+            $totalFinal = array_sum($colWidths);
+            if ($totalFinal !== $totalWidth) {
+                $diff = $totalWidth - $totalFinal;
+                $maxIdx = 0;
+                $maxVal = 0;
+                foreach ($colWidths as $i => $w) {
+                    if ($w > $maxVal) {
+                        $maxVal = $w;
+                        $maxIdx = $i;
+                    }
+                }
+                $colWidths[$maxIdx] += $diff;
+            }
+
+            $this->writeTableColumnWidths($table, $xpath, $colWidths, $columnCount, $totalWidth);
+            $adjustedCount++;
+        }
+
+        if ($adjustedCount > 0) {
+            $newXml = $dom->saveXML();
+            $zip->addFromString('word/document.xml', $newXml);
+        }
+
+        $zip->close();
+
+        if ($adjustedCount > 0) {
+            Log::info('Adjusted table column widths by content', [
+                'tables_adjusted' => $adjustedCount,
+                'path' => $docxPath
+            ]);
+        }
     }
 
     /**
@@ -3319,6 +3635,247 @@ HTML;
         $zip->close();
 
         Log::info('centerHeadingsInDocx: finished', ['centered_count' => $centeredCount, 'path' => $docxPath]);
+    }
+
+    /**
+     * 识别 Word 文档中的目录（TOC），删除旧目录，并根据文档中的一级和二级标题重新生成目录。
+     *
+     * 处理逻辑：
+     * 1. 查找文档中是否存在"目录"标题段落
+     * 2. 如果存在，删除旧目录内容（从"目录"标题到下一个标题之间的所有段落）
+     * 3. 扫描文档收集所有一级标题（Heading1）和二级标题（Heading2）
+     * 4. 在旧目录位置生成新目录，只包含一级和二级标题
+     */
+    private function regenerateTableOfContentsInDocx(string $docxPath): void
+    {
+        if (!class_exists('ZipArchive')) {
+            Log::warning('ZipArchive not available, cannot regenerate TOC');
+            return;
+        }
+
+        $zip = new \ZipArchive();
+        if ($zip->open($docxPath, \ZipArchive::CREATE) !== true) {
+            Log::error('Failed to open docx file for TOC regeneration', ['path' => $docxPath]);
+            return;
+        }
+
+        $documentXml = $zip->getFromName('word/document.xml');
+        if ($documentXml === false) {
+            $zip->close();
+            Log::error('word/document.xml not found in docx for TOC regeneration');
+            return;
+        }
+
+        $dom = new \DOMDocument();
+        libxml_use_internal_errors(true);
+        $dom->loadXML($documentXml);
+        libxml_clear_errors();
+
+        $xpath = new \DOMXPath($dom);
+        $xpath->registerNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main');
+
+        $wNs = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+
+        // Step 1: Find the TOC heading (paragraph containing "目录" with heading style)
+        $body = $xpath->query('//w:body')->item(0);
+        if (!$body) {
+            $zip->close();
+            return;
+        }
+
+        $allParagraphs = $xpath->query('//w:body/w:p');
+        $tocHeadingIndex = -1;
+        $tocHeadingElement = null;
+
+        foreach ($allParagraphs as $index => $paragraph) {
+            $pPr = $xpath->query('w:pPr', $paragraph)->item(0);
+            $pStyle = $pPr ? $xpath->query('w:pStyle', $pPr)->item(0) : null;
+            $styleVal = $pStyle ? $pStyle->getAttribute('w:val') : '';
+
+            $textContent = '';
+            $textNodes = $xpath->query('.//w:t', $paragraph);
+            foreach ($textNodes as $t) {
+                $textContent .= $t->textContent;
+            }
+
+            $isHeading = strpos($styleVal, 'Heading') === 0;
+
+            if ($isHeading && trim($textContent) === '目录') {
+                $tocHeadingIndex = $index;
+                $tocHeadingElement = $paragraph;
+                break;
+            }
+        }
+
+        if ($tocHeadingElement === null) {
+            $zip->close();
+            Log::info('No TOC heading ("目录") found, skipping TOC regeneration');
+            return;
+        }
+
+        Log::info('Found TOC heading, will remove old TOC and regenerate', ['index' => $tocHeadingIndex]);
+
+        // Step 2: Remove the TOC heading and all content until the next heading
+        $nodesToRemove = [];
+        $nodesToRemove[] = $tocHeadingElement;
+
+        $nextSibling = $tocHeadingElement->nextSibling;
+        $insertAfter = null;
+        while ($nextSibling) {
+            if ($nextSibling->nodeType === XML_ELEMENT_NODE) {
+                if ($nextSibling->nodeName === 'w:p') {
+                    $pPr = $xpath->query('w:pPr', $nextSibling)->item(0);
+                    $pStyle = $pPr ? $xpath->query('w:pStyle', $pPr)->item(0) : null;
+                    $styleVal = $pStyle ? $pStyle->getAttribute('w:val') : '';
+
+                    if (strpos($styleVal, 'Heading') === 0) {
+                        $insertAfter = $nextSibling;
+                        break;
+                    }
+                }
+                $nodesToRemove[] = $nextSibling;
+            }
+            $nextSibling = $nextSibling->nextSibling;
+        }
+
+        foreach ($nodesToRemove as $node) {
+            $node->parentNode->removeChild($node);
+        }
+
+        Log::info('Removed old TOC content', ['nodes_removed' => count($nodesToRemove)]);
+
+        // Step 3: Collect all Heading1 and Heading2 paragraphs from remaining content
+        $headings = [];
+        $remainingParagraphs = $xpath->query('//w:body/w:p');
+
+        foreach ($remainingParagraphs as $paragraph) {
+            $pPr = $xpath->query('w:pPr', $paragraph)->item(0);
+            $pStyle = $pPr ? $xpath->query('w:pStyle', $pPr)->item(0) : null;
+            $styleVal = $pStyle ? $pStyle->getAttribute('w:val') : '';
+
+            if ($styleVal !== 'Heading1' && $styleVal !== 'Heading2') {
+                continue;
+            }
+
+            $textContent = '';
+            $textNodes = $xpath->query('.//w:t', $paragraph);
+            foreach ($textNodes as $t) {
+                $textContent .= $t->textContent;
+            }
+
+            $headings[] = [
+                'level' => ($styleVal === 'Heading1') ? 1 : 2,
+                'text' => trim($textContent),
+            ];
+        }
+
+        Log::info('Collected headings for TOC', ['count' => count($headings)]);
+
+        // Step 4: Generate new TOC heading and entries
+        $headingCounter1 = 0;
+        $headingCounter2 = 0;
+
+        // Create and insert new TOC heading paragraph
+        $tocHeadingNew = $dom->createElementNS($wNs, 'w:p');
+
+        $tocPPr = $dom->createElementNS($wNs, 'w:pPr');
+        $tocPStyle = $dom->createElementNS($wNs, 'w:pStyle');
+        $tocPStyle->setAttribute('w:val', 'Heading1');
+        $tocPPr->appendChild($tocPStyle);
+
+        $tocJc = $dom->createElementNS($wNs, 'w:jc');
+        $tocJc->setAttribute('w:val', 'center');
+        $tocPPr->appendChild($tocJc);
+
+        $tocHeadingNew->appendChild($tocPPr);
+
+        $tocRun = $dom->createElementNS($wNs, 'w:r');
+        $tocRunPr = $dom->createElementNS($wNs, 'w:rPr');
+        $tocRFonts = $dom->createElementNS($wNs, 'w:rFonts');
+        $tocRFonts->setAttribute('w:eastAsia', 'SimSun');
+        $tocRunPr->appendChild($tocRFonts);
+        $tocB = $dom->createElementNS($wNs, 'w:b');
+        $tocRunPr->appendChild($tocB);
+        $tocRun->appendChild($tocRunPr);
+
+        $tocText = $dom->createElementNS($wNs, 'w:t');
+        $tocText->textContent = '目录';
+        $tocText->setAttribute('xml:space', 'preserve');
+        $tocRun->appendChild($tocText);
+        $tocHeadingNew->appendChild($tocRun);
+
+        // Insert before the reference point or at end of body
+        if ($insertAfter) {
+            $body->insertBefore($tocHeadingNew, $insertAfter);
+        } else {
+            $firstChild = $body->firstChild;
+            if ($firstChild) {
+                $body->insertBefore($tocHeadingNew, $firstChild);
+            } else {
+                $body->appendChild($tocHeadingNew);
+            }
+        }
+
+        $insertRef = $insertAfter ?: null;
+
+        // Generate TOC entries for each heading
+        foreach ($headings as $heading) {
+            if ($heading['level'] === 1) {
+                $headingCounter1++;
+                $headingCounter2 = 0;
+                $tocLineText = $headingCounter1 . '. ' . $heading['text'];
+            } else {
+                $headingCounter2++;
+                $tocLineText = '    ' . $headingCounter1 . '.' . $headingCounter2 . '. ' . $heading['text'];
+            }
+
+            $tocPara = $dom->createElementNS($wNs, 'w:p');
+
+            $tocParaPPr = $dom->createElementNS($wNs, 'w:pPr');
+            $tocPInd = $dom->createElementNS($wNs, 'w:ind');
+            if ($heading['level'] === 2) {
+                $tocPInd->setAttribute('w:left', '720');
+            }
+            $tocParaPPr->appendChild($tocPInd);
+            $tocPara->appendChild($tocParaPPr);
+
+            $tocParaRun = $dom->createElementNS($wNs, 'w:r');
+            $tocParaRunPr = $dom->createElementNS($wNs, 'w:rPr');
+            $tocParaRFonts = $dom->createElementNS($wNs, 'w:rFonts');
+            $tocParaRFonts->setAttribute('w:eastAsia', 'SimSun');
+            $tocParaRFonts->setAttribute('w:ascii', 'SimSun');
+            $tocParaRFonts->setAttribute('w:hAnsi', 'SimSun');
+            $tocParaRunPr->appendChild($tocParaRFonts);
+
+            $tocParaSz = $dom->createElementNS($wNs, 'w:sz');
+            $tocParaSz->setAttribute('w:val', '24');
+            $tocParaRunPr->appendChild($tocParaSz);
+
+            $tocParaRun->appendChild($tocParaRunPr);
+
+            $tocParaT = $dom->createElementNS($wNs, 'w:t');
+            $tocParaT->textContent = $tocLineText;
+            $tocParaT->setAttribute('xml:space', 'preserve');
+            $tocParaRun->appendChild($tocParaT);
+            $tocPara->appendChild($tocParaRun);
+
+            if ($insertRef) {
+                $body->insertBefore($tocPara, $insertRef);
+            } else {
+                $body->appendChild($tocPara);
+            }
+        }
+
+        // Save back
+        $newXml = $dom->saveXML();
+        $zip->addFromString('word/document.xml', $newXml);
+        $zip->close();
+
+        Log::info('TOC regeneration completed', [
+            'heading1_count' => $headingCounter1,
+            'heading2_count' => $headingCounter2,
+            'path' => $docxPath
+        ]);
     }
 
     /**
@@ -3441,6 +3998,9 @@ HTML;
         // ----- 4. 后处理：设置所有标题居中 -----
         $this->centerHeadingsInDocx($outputDocx);
 
+        // ----- 4.1 后处理：识别目录，删除旧目录，根据一级/二级标题重新生成目录 -----
+        $this->regenerateTableOfContentsInDocx($outputDocx);
+
         // ----- 5. 后处理：强制设置第一个段落样式（居中、宋体、12pt、加粗）-----
         $this->applyFirstParagraphStyleToDocx($outputDocx);
 
@@ -3458,6 +4018,9 @@ HTML;
 
         // ----- 8. 后处理：将列数超过10列的表格设置为横向布局 -----
         $this->setWideTablesToLandscape($outputDocx);
+
+        // ----- 8.1 后处理：根据内容自适应调整表格列宽，保持总宽度不变 -----
+        $this->adjustTableColumnWidthsByContent($outputDocx);
 
         // ----- 9. 验证输出文件 -----
         if (!file_exists($outputDocx) || filesize($outputDocx) === 0) {
