@@ -319,7 +319,7 @@ class PageController extends Controller
             Log::warning('HTML table still present after conversion attempt');
         }
 
-        $markdown = $this->removeFirstH1FromMarkdown($markdown);
+        $markdown = $this->removeFirstH1FromMarkdown($markdown, $page->name);
         $markdown = $this->normalizeMarkdownContent($markdown);
         $markdown = $this->replaceNonBreakingSpacesInMarkdown($markdown);
         $markdown = $this->convertCheckboxesInMarkdown($markdown);
@@ -546,15 +546,18 @@ class PageController extends Controller
     /**
      * Remove first h1 heading from markdown content.
      */
-    private function removeFirstH1FromMarkdown(string $markdown): string
+    private function removeFirstH1FromMarkdown(string $markdown, string $pageName = ''): string
     {
         $lines = explode("\n", $markdown);
         $firstLineRemoved = false;
 
-        $filtered = array_filter($lines, function ($line) use (&$firstLineRemoved) {
+        $filtered = array_filter($lines, function ($line) use (&$firstLineRemoved, $pageName) {
             if (!$firstLineRemoved && preg_match('/^#\s+/', $line)) {
                 $firstLineRemoved = true;
-                return false;
+                $headingText = trim(preg_replace('/^#\s+/', '', $line));
+                if ($headingText === trim($pageName)) {
+                    return false;
+                }
             }
             return true;
         });
@@ -631,7 +634,14 @@ class PageController extends Controller
 
                 $isTocLine = $this->isTocListItem($trimmed);
 
-                if (!$isTocLine && !empty($trimmed) && !$this->isHeadingLine($trimmed) && $trimmed !== '---') {
+                if ($this->isHeadingLine($trimmed)) {
+                    $inTocBlock = false;
+                    $result[] = $this->wrapTocInPreTag($tocLines);
+                    $result[] = $line;
+                    continue;
+                }
+
+                if (!$isTocLine && !empty($trimmed) && $trimmed !== '---') {
                     $inTocBlock = false;
                     $result[] = $this->wrapTocInPreTag($tocLines);
                     $result[] = $line;
@@ -1123,7 +1133,7 @@ class PageController extends Controller
         $htmlContent = preg_replace('/src="\/(storage\/[^"]+)"/', 'src="' . $baseUrl . '/$1"', $htmlContent);
         
         // 移除第一个 h1 标签（文档名称）
-        $htmlContent = $this->removeFirstH1($htmlContent);
+        $htmlContent = $this->removeFirstH1($htmlContent, $page->name);
 
         // 处理审批表格（编制/审核/批准），清除填写内容并在表格后添加分页
         $htmlContent = $this->processApprovalTable($htmlContent);
@@ -1175,7 +1185,7 @@ HTML;
     /**
      * 移除HTML内容中的第一个h1标签
      */
-    private function removeFirstH1(string $html): string
+    private function removeFirstH1(string $html, string $pageName = ''): string
     {
         try {
             $dom = new \DOMDocument();
@@ -1183,8 +1193,11 @@ HTML;
             $h1s = $dom->getElementsByTagName('h1');
             if ($h1s->length > 0) {
                 $firstH1 = $h1s->item(0);
-                $firstH1->parentNode->removeChild($firstH1);
-                $html = $dom->saveHTML();
+                $headingText = trim($firstH1->textContent);
+                if ($headingText === trim($pageName)) {
+                    $firstH1->parentNode->removeChild($firstH1);
+                    $html = $dom->saveHTML();
+                }
             }
         } catch (\Exception $e) {
             Log::warning('Failed to remove first h1 tag: ' . $e->getMessage());
