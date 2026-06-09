@@ -3643,7 +3643,7 @@ HTML;
     }
 
     /**
-     * 设置所有表格的表头行（第一行）文字居中对齐。
+     * 设置所有表格的表头行（第一行）文字靠左对齐。
      * 通过修改 word/document.xml 中表头单元格的 <w:pPr> 元素实现。
      */
     private function formatTableHeadersInDocx(string $docxPath): void
@@ -3706,7 +3706,7 @@ HTML;
                         $jc = $dom->createElementNS($wNs, 'w:jc');
                         $pPr->appendChild($jc);
                     }
-                    $jc->setAttribute('w:val', 'center');
+                    $jc->setAttribute('w:val', 'left');
                 }
             }
 
